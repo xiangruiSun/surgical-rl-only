@@ -1,0 +1,8 @@
+numpy>=1.23,<2.0
+scipy>=1.9,<2.0
+PyYAML>=6.0
+opencv-contrib-python>=4.5,<5
+matplotlib>=3.6
+pandas>=1.5
+pytest>=7
+

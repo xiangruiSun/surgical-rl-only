@@ -1,0 +1,6 @@
+# Install a CUDA-compatible PyTorch build first; do not let pip silently replace it.
+-r analysis.txt
+gymnasium==0.29.1
+stable-baselines3==2.2.1
+tensorboard>=2.12
+trimesh>=3.20
