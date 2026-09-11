@@ -1,0 +1,16 @@
+# Inference-only dependencies for the deployment host (lcsr-dvrk-15).
+# ROS 2 (rclpy, geometry_msgs, sensor_msgs, std_msgs) comes from
+# /opt/ros/humble, NOT from pip.
+#
+#   python3 -m venv --system-site-packages .venv-deploy
+#   source .venv-deploy/bin/activate
+#   pip install -r requirements-deploy.txt
+#
+# --system-site-packages keeps the ROS python packages visible.
+
+numpy>=1.24,<3
+scipy>=1.10
+stable-baselines3>=2.0,<3
+gymnasium>=0.29
+# CPU torch is enough: the actor is 3x256 MLP, ~1 ms per inference.
+torch>=2.0
