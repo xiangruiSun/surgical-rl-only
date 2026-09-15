@@ -23,8 +23,50 @@ def node_module():
         stubs[name] = module
         return module
 
+    class _Logger:
+        def __init__(self):
+            self.lines = []
+
+        def info(self, msg):
+            self.lines.append(("info", msg))
+
+        def warn(self, msg):
+            self.lines.append(("warn", msg))
+
+        def error(self, msg):
+            self.lines.append(("error", msg))
+
+    class _Clock:
+        def now(self):
+            return types.SimpleNamespace(to_msg=lambda: None)
+
     class _Node:
         def __init__(self, *a, **k):
+            self._logger = _Logger()
+            self.published = []
+
+        def create_subscription(self, *a, **k):
+            return None
+
+        def create_publisher(self, *a, **k):
+            node = self
+
+            class _Pub:
+                def publish(self, msg):
+                    node.published.append(msg)
+
+            return _Pub()
+
+        def create_timer(self, *a, **k):
+            return None
+
+        def get_logger(self):
+            return self._logger
+
+        def get_clock(self):
+            return _Clock()
+
+        def destroy_node(self):
             pass
 
     class _QoS:
@@ -38,7 +80,8 @@ def node_module():
     rclpy.logging = types.SimpleNamespace(get_logger=lambda name: None)
     stub("rclpy.node", Node=_Node)
     stub("rclpy.qos", QoSProfile=_QoS,
-         ReliabilityPolicy=types.SimpleNamespace(RELIABLE="reliable"))
+         ReliabilityPolicy=types.SimpleNamespace(
+             RELIABLE="reliable", BEST_EFFORT="best_effort"))
     stub("geometry_msgs", )
     stub("geometry_msgs.msg", PoseStamped=object)
     stub("sensor_msgs", )
@@ -123,6 +166,160 @@ def test_safety_caps_match_the_approach_entry_point(node_module):
 def test_lift_success_tolerance_is_tighter_than_the_lift(node_module):
     args = node_module.parse_args(["--grasp-pos", "0", "0", "0"])
     assert args.lift_success_trans_cm < args.lift_distance_cm
+
+
+def test_subscriptions_default_to_best_effort(node_module):
+    """A RELIABLE subscriber does not match a BEST_EFFORT publisher, which is
+    how /PSM1/jaw/measured_js echoed fine on the command line while the node
+    saw nothing. BEST_EFFORT matches publishers of either kind."""
+    args = node_module.parse_args(["--grasp-pos", "0", "0", "0"])
+    assert args.sub_reliability == "best_effort"
+
+
+def test_dry_runs_walk_the_sequence_by_default(node_module):
+    args = node_module.parse_args(["--grasp-pos", "0", "0", "0"])
+    assert args.dry_run_static is False
+    assert args.dry_run_simulate is True
+
+
+def test_dry_run_can_be_made_static(node_module):
+    args = node_module.parse_args(
+        ["--grasp-pos", "0", "0", "0", "--dry-run-static"]
+    )
+    assert args.dry_run_simulate is False
+
+
+# --- the dry-run walkthrough ---------------------------------------------
+def _build_node(node_module, plan, baseline, argv):
+    from surgicai_rl_deploy.controllers import D2Controller
+    from surgicai_rl_deploy.loop import SafetyLimits
+    from surgicai_rl_deploy.sequence import SequenceConfig, GraspLiftSequencer
+
+    args = node_module.parse_args(argv)
+    sequencer = GraspLiftSequencer(
+        plan, D2Controller(staged=True),
+        SequenceConfig(grasp_gate="always"), SafetyLimits(), baseline,
+    )
+    node = node_module.GraspLiftNode(args, plan, sequencer, plan.jaw)
+    node._measured = (plan.start.p, plan.start.quat_xyzw())
+    node._measured_frame = "ECM"
+    node._jaw_rad = plan.jaw.approach_open_rad
+    node._jaw_effort = 0.02
+    return node, sequencer
+
+
+def test_simulated_dry_run_advances_past_the_start_pose(node_module, plan, baseline):
+    """With nothing published the arm cannot move, so a static dry run sits at
+    the start and always dies at max_steps. The simulated one must progress."""
+    import time as _time
+
+    node, sequencer = _build_node(
+        node_module, plan, baseline, ["--grasp-pos", "0", "0", "0", "--lift-sign", "-1"]
+    )
+    assert node.simulate is True
+    node._measured_stamp = _time.monotonic()
+    sequencer.begin(node._state())
+    node._started = True
+
+    for _ in range(40):
+        node._measured_stamp = _time.monotonic()
+        node.tick()
+        if node.finished:
+            break
+
+    moved_cm = float(
+        np.linalg.norm(node._sim_pose.p - plan.start.p) * 100.0
+    )
+    assert moved_cm > 0.5, "the simulated arm never left the start pose"
+
+
+def test_a_static_dry_run_never_moves(node_module, plan, baseline):
+    import time as _time
+
+    node, sequencer = _build_node(
+        node_module, plan, baseline,
+        ["--grasp-pos", "0", "0", "0", "--lift-sign", "-1", "--dry-run-static"],
+    )
+    assert node.simulate is False
+    node._measured_stamp = _time.monotonic()
+    sequencer.begin(node._state())
+    node._started = True
+    for _ in range(10):
+        node._measured_stamp = _time.monotonic()
+        node.tick()
+    assert node._sim_pose is None
+    assert sequencer.phase == "approach"
+
+
+def test_a_dry_run_publishes_nothing(node_module, plan, baseline):
+    import time as _time
+
+    node, sequencer = _build_node(
+        node_module, plan, baseline, ["--grasp-pos", "0", "0", "0", "--lift-sign", "-1"]
+    )
+    node._measured_stamp = _time.monotonic()
+    sequencer.begin(node._state())
+    node._started = True
+    for _ in range(30):
+        node._measured_stamp = _time.monotonic()
+        node.tick()
+    assert node.published == []
+
+
+def test_a_stale_pose_still_aborts_a_live_run(node_module, plan, baseline):
+    """Relaxing the freshness guards for dry runs must not relax them for
+    --execute: that guard is the one that stops motion against a dead feed."""
+    import time as _time
+
+    node, sequencer = _build_node(
+        node_module, plan, baseline,
+        ["--grasp-pos", "0", "0", "0", "--lift-sign", "-1", "--execute"],
+    )
+    assert node.simulate is False  # never simulate while publishing
+    node._measured_stamp = _time.monotonic()
+    node._jaw_stamp = _time.monotonic()
+    sequencer.begin(node._state())
+    node._started = True
+
+    node._measured_stamp = _time.monotonic() - 10.0  # feed went dead
+    node.tick()
+    assert node.finished
+    assert "stale measured_cp" in sequencer.reason or node.finished
+
+
+def test_a_stale_jaw_still_aborts_a_live_run(node_module, plan, baseline):
+    import time as _time
+
+    node, sequencer = _build_node(
+        node_module, plan, baseline,
+        ["--grasp-pos", "0", "0", "0", "--lift-sign", "-1", "--execute"],
+    )
+    node._measured_stamp = _time.monotonic()
+    node._jaw_stamp = _time.monotonic() - 10.0
+    sequencer.begin(node._state())
+    node._started = True
+    node.tick()
+    assert node.finished
+
+
+def test_a_dry_run_tolerates_a_silent_jaw_topic(node_module, plan, baseline):
+    """A dry run should still walk the sequence and say the feed is silent."""
+    import time as _time
+
+    node, sequencer = _build_node(
+        node_module, plan, baseline, ["--grasp-pos", "0", "0", "0", "--lift-sign", "-1"]
+    )
+    node._measured_stamp = _time.monotonic()
+    node._jaw_stamp = _time.monotonic() - 10.0  # silent
+    sequencer.begin(node._state())
+    node._started = True
+    for _ in range(20):
+        node._measured_stamp = _time.monotonic()
+        node.tick()
+        if node.finished:
+            break
+    assert node._sim_pose is not None
+    assert any("stale" in msg for _, msg in node.get_logger().lines)
 
 
 def test_jaw_calibration_flags_build_a_valid_calibration(node_module):

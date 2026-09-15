@@ -19,7 +19,7 @@ surgicai_rl_deploy/
 tools/
   calibrate_jaw.py           what an empty close looks like on YOUR arm
   offline_grasp_lift.py      replay the whole sequence with no robot
-tests/                       124 tests, no ROS or robot required
+tests/                       133 tests, no ROS or robot required
 ```
 
 ---
@@ -187,6 +187,22 @@ Check in the log that `frame` is `ECM`, that `start` matches
 expect, and that `jaw/measured_js` is actually publishing (and whether it
 carries an `effort` field).
 
+A dry run publishes nothing, so the arm cannot move. By default the dry run
+therefore **simulates** a perfect arm landing on each command and walks the
+whole sequence; poses after the first cycle are marked as simulated and are not
+measurements. `--dry-run-static` keeps reading the real `measured_cp` instead,
+in which case the approach can never converge and the episode always ends at
+`max_steps` — that is the arm not moving, not the controller failing.
+
+### QoS
+
+Subscriptions default to **BEST_EFFORT** (`--sub-reliability`). A RELIABLE
+subscriber does not match a BEST_EFFORT publisher, and dVRK state topics are
+not uniform: on lcsr-dvrk-15 `measured_cp` matched a RELIABLE subscriber and
+`jaw/measured_js` did not, so the jaw looked absent while `ros2 topic echo`
+showed it publishing fine. BEST_EFFORT matches either kind. Command publishers
+stay RELIABLE.
+
 ### 3. Rehearse with an empty gripper
 
 Same command plus `--execute --grasp-gate always --controller d2 --interface
@@ -281,7 +297,7 @@ why the real run makes you state it.
 ## Tests
 
 ```bash
-python3 -m pytest tests -q        # 124 tests, no ROS and no robot
+python3 -m pytest tests -q        # 133 tests, no ROS and no robot
 ```
 
 Covers the jaw mapping and evidence logic, the lift geometry, every precheck

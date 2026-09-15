@@ -70,8 +70,21 @@ class GraspLiftNode(Node):
         self.sequencer = sequencer
         self.jaw_cal = jaw_cal
 
-        qos = QoSProfile(depth=10)
-        qos.reliability = ReliabilityPolicy.RELIABLE
+        # Subscriptions default to BEST_EFFORT because a RELIABLE subscriber
+        # will not match a BEST_EFFORT publisher, while a BEST_EFFORT
+        # subscriber matches either.  dVRK state topics are not uniform across
+        # arms and versions -- on lcsr-dvrk-15 measured_cp matched a RELIABLE
+        # subscriber and jaw/measured_js did not, which silently left the jaw
+        # unmonitored.  Commands stay RELIABLE: a dropped setpoint matters.
+        sub_qos = QoSProfile(depth=10)
+        sub_qos.reliability = (
+            ReliabilityPolicy.RELIABLE
+            if args.sub_reliability == "reliable"
+            else ReliabilityPolicy.BEST_EFFORT
+        )
+        pub_qos = QoSProfile(depth=10)
+        pub_qos.reliability = ReliabilityPolicy.RELIABLE
+        qos = sub_qos
 
         self._measured = None
         self._measured_stamp = 0.0
@@ -92,11 +105,22 @@ class GraspLiftNode(Node):
             self.create_subscription(Bool, args.confirm_topic, self._on_confirm, qos)
 
         self.cmd_pub = self.create_publisher(
-            PoseStamped, f"{self.arm}/{args.interface}", qos
+            PoseStamped, f"{self.arm}/{args.interface}", pub_qos
         )
         self.jaw_pub = self.create_publisher(
-            JointState, f"{self.arm}/jaw/{args.jaw_interface}", qos
+            JointState, f"{self.arm}/jaw/{args.jaw_interface}", pub_qos
         )
+
+        # Dry-run walkthrough: with nothing published the arm cannot move, so
+        # the loop can never converge and every dry run ends in
+        # "approach max_steps", which tells the operator nothing.  Feeding the
+        # command back as the next measured pose walks the whole sequence
+        # instead.  Clearly labelled: these poses are simulated, not measured.
+        self.simulate = bool(getattr(args, "dry_run_simulate", False)) and not args.execute
+        self._sim_pose = None
+        self._sim_jaw_rad = None
+        self._warned_stale_cp = False
+        self._warned_stale_jaw = False
 
         self.trace_file = open(args.trace, "w") if args.trace else None
         self.finished = False
@@ -125,6 +149,20 @@ class GraspLiftNode(Node):
     def _state(self) -> Optional[ArmState]:
         if self._measured is None:
             return None
+        if self.simulate and self._sim_pose is not None:
+            # A perfect arm that lands exactly on the last command.  Optimistic
+            # by construction, which is the point: it shows the plan, not the
+            # tracking.
+            jaw_rad = self._sim_jaw_rad
+            return ArmState(
+                pose=Pose(
+                    self._sim_pose.p,
+                    self._sim_pose.R,
+                    0.0 if jaw_rad is None else self.jaw_cal.normalise(jaw_rad),
+                ),
+                jaw_rad=jaw_rad,
+                jaw_effort=None,
+            )
         pos, quat = self._measured
         jaw_norm = (
             0.0 if self._jaw_rad is None else self.jaw_cal.normalise(self._jaw_rad)
@@ -239,7 +277,18 @@ class GraspLiftNode(Node):
             for line in report["out_of_distribution"]:
                 self.get_logger().warn(f"  - {line}")
         if not self.args.execute:
-            self.get_logger().info("DRY RUN: no command will be published")
+            if self.simulate:
+                self.get_logger().info(
+                    "DRY RUN: nothing is published. Poses after the first cycle "
+                    "are SIMULATED (a perfect arm landing on each command), so "
+                    "you see the whole sequence. They are not measurements."
+                )
+            else:
+                self.get_logger().info(
+                    "DRY RUN (static): nothing is published, so the arm will not "
+                    "move and the approach cannot converge. Expect the episode "
+                    "to end at max_steps; that is not a controller failure."
+                )
 
         self._log(
             {
@@ -260,18 +309,32 @@ class GraspLiftNode(Node):
         if self.finished or not self._started:
             return
 
+        # The freshness guards exist to stop motion against a dead feed.  In a
+        # dry run nothing moves, so a silent topic is worth saying once, not
+        # worth killing the walkthrough over.
         age = time.monotonic() - self._measured_stamp
         if age > self.sequencer.limits.max_pose_age_s:
-            self.get_logger().error(f"measured_cp stale ({age:.2f} s) - stopping")
-            self.finish("abort: stale measured_cp")
-            return
-        if (
-            self._jaw_rad is not None
-            and time.monotonic() - self._jaw_stamp > self.args.max_jaw_age_s
-        ):
-            self.get_logger().error("jaw/measured_js stale - stopping")
-            self.finish("abort: stale jaw/measured_js")
-            return
+            if self.args.execute:
+                self.get_logger().error(f"measured_cp stale ({age:.2f} s) - stopping")
+                self.finish("abort: stale measured_cp")
+                return
+            if not self._warned_stale_cp:
+                self._warned_stale_cp = True
+                self.get_logger().warn(
+                    f"measured_cp stale ({age:.2f} s). In a live run this aborts."
+                )
+        jaw_age = time.monotonic() - self._jaw_stamp
+        if self._jaw_rad is not None and jaw_age > self.args.max_jaw_age_s:
+            if self.args.execute:
+                self.get_logger().error("jaw/measured_js stale - stopping")
+                self.finish("abort: stale jaw/measured_js")
+                return
+            if not self._warned_stale_jaw:
+                self._warned_stale_jaw = True
+                self.get_logger().warn(
+                    f"jaw/measured_js stale ({jaw_age:.2f} s). In a live run "
+                    "this aborts."
+                )
 
         state = self._state()
         step = self.sequencer.step(state)
@@ -300,6 +363,10 @@ class GraspLiftNode(Node):
         if self.args.execute and not step.reason.startswith("abort"):
             self._publish(step.command)
 
+        if self.simulate:
+            self._sim_pose = step.command.pose
+            self._sim_jaw_rad = step.command.jaw_rad
+
         if step.done:
             self.finish(step.reason)
 
@@ -308,6 +375,16 @@ class GraspLiftNode(Node):
         summary = self.sequencer.summary()
         log = self.get_logger().info if reason == "success" else self.get_logger().warn
         log(f"episode finished: {reason}")
+        if not self.args.execute:
+            log(
+                "this was a DRY RUN: no command reached the arm"
+                + (
+                    ". The poses above after the first cycle were simulated."
+                    if self.simulate
+                    else ", so the arm could not move and this outcome says "
+                    "nothing about the controller."
+                )
+            )
         log(
             "grasp verified: NO. This arm has no grasp sensor; the jaw readings "
             "in the trace are observations, not proof the needle was picked up."
@@ -428,12 +505,28 @@ def parse_args(argv=None):
     ap.add_argument("--limit-high", nargs=3, type=float, default=None)
 
     ap.add_argument("--expect-frame", default="ECM")
+    ap.add_argument("--sub-reliability", choices=["best_effort", "reliable"],
+                    default="best_effort",
+                    help="QoS reliability requested for measured_cp and "
+                         "jaw/measured_js. best_effort matches publishers of "
+                         "either kind; reliable silently fails to match a "
+                         "best_effort publisher, which is how a jaw topic can "
+                         "echo fine on the command line and never reach a node.")
+    ap.add_argument("--dry-run-static", action="store_true",
+                    help="in a dry run, keep reading the real measured_cp. The "
+                         "arm cannot move because nothing is published, so the "
+                         "approach never converges and the episode always ends "
+                         "at max_steps. Off by default: a dry run instead feeds "
+                         "each command back as the next pose and walks the "
+                         "whole sequence.")
     ap.add_argument("--trace", default=None)
     ap.add_argument("--strict", action="store_true",
                     help="treat every precheck warning as a failure")
     ap.add_argument("--execute", action="store_true",
                     help="actually publish; without it this is a dry run")
-    return ap.parse_args(argv)
+    parsed = ap.parse_args(argv)
+    parsed.dry_run_simulate = not parsed.dry_run_static
+    return parsed
 
 
 def main(argv=None) -> int:
@@ -460,7 +553,11 @@ def main(argv=None) -> int:
     # real numbers before the real node publishes anything.
     probe = rclpy.create_node("surgicai_grasp_lift_probe")
     qos = QoSProfile(depth=10)
-    qos.reliability = ReliabilityPolicy.RELIABLE
+    qos.reliability = (
+        ReliabilityPolicy.RELIABLE
+        if args.sub_reliability == "reliable"
+        else ReliabilityPolicy.BEST_EFFORT
+    )
     holder = {}
 
     def _probe_cp(msg):
@@ -486,8 +583,11 @@ def main(argv=None) -> int:
     probe.create_subscription(
         JointState, f"{args.arm.rstrip('/')}/jaw/measured_js", _probe_jaw, qos
     )
+    # Wait for BOTH topics, not just the pose.  measured_cp usually arrives
+    # first, and returning the moment it does used to leave the jaw looking
+    # absent when it was merely a few milliseconds behind.
     deadline = time.monotonic() + 5.0
-    while "pose" not in holder and time.monotonic() < deadline:
+    while ("pose" not in holder or "jaw" not in holder) and time.monotonic() < deadline:
         rclpy.spin_once(probe, timeout_sec=0.1)
     probe.destroy_node()
 
@@ -574,7 +674,9 @@ def main(argv=None) -> int:
     sequencer.confirm_callback = node._confirm_callback
 
     deadline = time.monotonic() + 5.0
-    while node._measured is None and time.monotonic() < deadline:
+    while (
+        node._measured is None or node._jaw_rad is None
+    ) and time.monotonic() < deadline:
         rclpy.spin_once(node, timeout_sec=0.1)
     if node._measured is None:
         node.get_logger().error("lost measured_cp between the precheck and the run")
