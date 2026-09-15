@@ -238,3 +238,52 @@ def test_jaw_calibration_flags_build_a_valid_calibration(node_module):
         grip_rad=float(np.deg2rad(args.jaw_grip_deg)),
         approach_open_rad=float(np.deg2rad(args.jaw_approach_open_deg)),
     )
+
+
+def test_r6_support_is_a_warning_only_for_the_learned_policy(
+    node_module, plan, baseline
+):
+    """A WARN on a live arm should mean "consider stopping". The R6 trained
+    region does not bind the geometric servo, so under d2 it is logged as
+    information, matching what the precheck already says."""
+    node, sequencer = _build_node(
+        node_module, plan, baseline, ["--grasp-pos", "0", "0", "0", "--lift-sign", "-1"]
+    )
+    node._measured_stamp = __import__("time").monotonic()
+    node.start_episode(_FakeReport())
+    levels = {
+        level for level, msg in node.get_logger().lines
+        if "R6" in msg or "demonstration support" in msg
+    }
+    assert levels == {"info"}
+
+
+def test_r6_support_warns_under_the_rl_controller(node_module, plan, baseline):
+    from surgicai_rl_deploy.controllers import RLController
+
+    node, sequencer = _build_node(
+        node_module, plan, baseline, ["--grasp-pos", "0", "0", "0", "--lift-sign", "-1"]
+    )
+
+    class _Policy:
+        def act(self, obs):
+            return np.zeros(7)
+
+        def describe(self):
+            return "stub"
+
+    sequencer.approach_controller = RLController(_Policy())
+    node._measured_stamp = __import__("time").monotonic()
+    node.start_episode(_FakeReport())
+    levels = {
+        level for level, msg in node.get_logger().lines
+        if "demonstration support" in msg
+    }
+    assert levels == {"warn"}
+
+
+class _FakeReport:
+    """Stands in for feasibility.PrecheckReport in start_episode's trace line."""
+
+    def as_dict(self):
+        return {"ok": True, "strict": False, "checks": []}

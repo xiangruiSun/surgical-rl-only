@@ -272,10 +272,30 @@ class GraspLiftNode(Node):
         self.get_logger().info(f"lift            : {self.plan.lift_spec.describe()}")
         self.get_logger().info(f"{self.jaw_cal.describe()}")
         self.get_logger().info(f"grasp gate      : {self.sequencer.cfg.grasp_gate}")
+        # The R6 support bounds the learned policy and nothing else.  Logging
+        # it as a warning under the geometric servo contradicts the precheck,
+        # which has already said the trained region does not apply -- and a
+        # warning mid-run on a live arm should mean "consider stopping", not
+        # "here is a number that does not bind you".
+        controller_name = getattr(self.sequencer.approach_controller, "name", "")
+        policy_driven = controller_name in ("rl", "residual")
         if report["out_of_distribution"]:
-            self.get_logger().warn("approach is OUTSIDE the R6 demonstration support:")
-            for line in report["out_of_distribution"]:
-                self.get_logger().warn(f"  - {line}")
+            if policy_driven:
+                self.get_logger().warn(
+                    "approach is OUTSIDE the R6 demonstration support, where "
+                    "the policy has been measured to orbit the goal rather "
+                    "than reach it:"
+                )
+                for line in report["out_of_distribution"]:
+                    self.get_logger().warn(f"  - {line}")
+            else:
+                self.get_logger().info(
+                    f"R6 training support does not apply to controller "
+                    f"'{controller_name}' (geometric). For reference only, the "
+                    "RL path would flag:"
+                )
+                for line in report["out_of_distribution"]:
+                    self.get_logger().info(f"  - {line}")
         if not self.args.execute:
             if self.simulate:
                 self.get_logger().info(

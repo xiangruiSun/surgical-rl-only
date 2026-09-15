@@ -208,7 +208,7 @@ tools/
   offline_check.py              replay against a kinematic mock, no robot
   offline_grasp_lift.py         replay the whole grasp+lift sequence, no robot
   calibrate_jaw.py              what an empty jaw close looks like on your arm
-tests/                          143 tests; no ROS, no robot, no checkpoint
+tests/                          145 tests; no ROS, no robot, no checkpoint
 ```
 
 ## Contract notes

@@ -148,5 +148,3 @@ def node_module():
             sys.modules.pop(key, None)
         else:
             sys.modules[key] = value
-
-

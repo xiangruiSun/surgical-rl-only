@@ -19,7 +19,7 @@ surgicai_rl_deploy/
 tools/
   calibrate_jaw.py           what an empty close looks like on YOUR arm
   offline_grasp_lift.py      replay the whole sequence with no robot
-tests/                       143 tests, no ROS or robot required
+tests/                       145 tests, no ROS or robot required
 ```
 
 ---
@@ -297,7 +297,7 @@ why the real run makes you state it.
 ## Tests
 
 ```bash
-python3 -m pytest tests -q        # 143 tests, no ROS and no robot
+python3 -m pytest tests -q        # 145 tests, no ROS and no robot
 ```
 
 Covers the jaw mapping and evidence logic, the lift geometry, every precheck
