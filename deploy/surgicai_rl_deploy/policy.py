@@ -19,7 +19,11 @@ from pathlib import Path
 
 import numpy as np
 
-# Published SHA256 digests (models/rl/MANIFEST.sha256).
+from .contract import CHECKPOINT_CONTRACTS, CONTRACTS, OTHER_UPSTREAM_CHECKPOINTS
+
+# Published SHA256 digests (models/rl/MANIFEST.sha256) plus every upstream
+# checkpoint this package has a contract for, so a released file is recognised
+# rather than needing --allow-unknown-model.
 KNOWN_CHECKPOINTS = {
     "0407987e296d78b8b63ccf49c16e35395b00cf8d4ebc4cfe857b57f3381f2a2f": (
         "m3_measured_r3_100k"
@@ -27,6 +31,8 @@ KNOWN_CHECKPOINTS = {
     "6286a88c21f04abfbc4b0747a87a67bc2c5dcba17f710692c6b5138f7776e525": (
         "r6_unified_single_goal_yaw15_seed1_final"
     ),
+    **{d: CONTRACTS[k].name for d, k in CHECKPOINT_CONTRACTS.items()},
+    **OTHER_UPSTREAM_CHECKPOINTS,
 }
 
 _SAFE_CUSTOM_OBJECTS = {

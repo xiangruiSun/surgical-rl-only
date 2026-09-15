@@ -52,7 +52,10 @@ from .feasibility import precheck
 from .frames import Pose
 from .jaw import JawBaseline, JawCalibration, JawCalibrationError
 from .loop import SafetyLimits
-from .plan import LiftSpec, build_plan
+from .contract import CONTRACTS
+from .plan import LiftSpec, TransportSpec, build_plan
+
+_CONTRACT_NAMES = tuple(CONTRACTS)
 from .sequence import (
     ArmState,
     GraspLiftSequencer,
@@ -270,6 +273,21 @@ class GraspLiftNode(Node):
         self.get_logger().info(f"grasp        cm : {np.round(self.plan.grasp.p * 100, 3)}")
         self.get_logger().info(f"lift target  cm : {np.round(self.plan.lifted.p * 100, 3)}")
         self.get_logger().info(f"lift            : {self.plan.lift_spec.describe()}")
+        if self.plan.staged is not None:
+            self.get_logger().info(
+                f"staged       cm : {np.round(self.plan.staged.p * 100, 3)}  "
+                "(servo target before the policy takes over)"
+            )
+        if self.plan.suture is not None:
+            if (via := self.plan.via) is not None:
+                self.get_logger().info(
+                    f"via          cm : {np.round(via.p * 100, 3)}"
+                )
+            self.get_logger().info(
+                f"suture       cm : {np.round(self.plan.suture.p * 100, 3)}  "
+                "(TOOL pose; where the needle ends up also depends on how it "
+                "sits in the jaws, which nothing here measures)"
+            )
         self.get_logger().info(f"{self.jaw_cal.describe()}")
         self.get_logger().info(f"grasp gate      : {self.sequencer.cfg.grasp_gate}")
         # The R6 support bounds the learned policy and nothing else.  Logging
@@ -279,10 +297,19 @@ class GraspLiftNode(Node):
         # "here is a number that does not bind you".
         controller_name = getattr(self.sequencer.approach_controller, "name", "")
         policy_driven = controller_name in ("rl", "residual")
-        if report["out_of_distribution"]:
+        if report.get("staging") is not None:
+            staging = report["staging"]
+            self.get_logger().info(
+                f"staging      : {staging['contract']}, offset "
+                f"{np.round(staging['offset_tool_cm'], 2)} cm, rotation "
+                f"{staging['rotation_deg']:.1f} deg, in support="
+                f"{staging['in_support']}"
+            )
+        if report.get("out_of_distribution"):
             if policy_driven:
                 self.get_logger().warn(
-                    "approach is OUTSIDE the R6 demonstration support, where "
+                    "approach is OUTSIDE the checkpoint's demonstration "
+                    "support, where "
                     "the policy has been measured to orbit the goal rather "
                     "than reach it:"
                 )
@@ -290,9 +317,9 @@ class GraspLiftNode(Node):
                     self.get_logger().warn(f"  - {line}")
             else:
                 self.get_logger().info(
-                    f"R6 training support does not apply to controller "
-                    f"'{controller_name}' (geometric). For reference only, the "
-                    "RL path would flag:"
+                    f"the checkpoint's demonstration support does not bind "
+                    f"controller '{controller_name}' (geometric). For reference "
+                    "only, the RL path would flag:"
                 )
                 for line in report["out_of_distribution"]:
                     self.get_logger().info(f"  - {line}")
@@ -487,21 +514,57 @@ def _step_size_from(args):
         step[6] = args.jaw_step
     return step
 
-def build_controller(args):
-    if args.controller == "d2":
-        return D2Controller(staged=True)
+def _load_policy(path, device, verify, named_contract=None):
+    """Return ``(policy, contract)``, resolving the contract from the digest."""
+    from .contract import contract_for_digest
     from .policy import ApproachPolicy
 
+    policy = ApproachPolicy.load(path, device=device, verify=verify)
+    if named_contract:
+        return policy, CONTRACTS[named_contract]
+    contract = contract_for_digest(policy.sha256)
+    if contract is None:
+        print(
+            f"WARNING: {Path(path).name} has no registered contract "
+            f"(sha256 {policy.sha256[:12]}). Its action scale, episode budget "
+            "and tolerances are therefore guesses, and a policy driven at the "
+            "wrong action scale tracks briefly and then diverges. Settle it "
+            "with tools/replay_demos.py --compare before --execute.",
+            file=sys.stderr,
+        )
+    return policy, contract
+
+
+def build_controller(args):
+    """Return ``(controller, contract)`` for the approach leg."""
+    if args.controller == "d2":
+        # A named contract still applies: staging into a demonstrated support
+        # is geometry, and comparing the servo against the same support is the
+        # whole point of having both controllers.
+        named = getattr(args, "contract", None)
+        return D2Controller(staged=True), (CONTRACTS[named] if named else None)
     if not args.model:
         raise SystemExit("--model is required for the rl/residual controllers")
-    policy = ApproachPolicy.load(
-        args.model, device=args.device, verify=not args.allow_unknown_model
+    policy, contract = _load_policy(
+        args.model, args.device, not args.allow_unknown_model,
+        getattr(args, "contract", None),
     )
     if args.controller == "rl":
-        return RLController(policy)
+        return RLController(policy), contract
     return ResidualController(
         policy, policy_weight=args.policy_weight, servo_weight=args.servo_weight
+    ), contract
+
+
+def build_shadow(args):
+    """Return ``(controller, contract)`` for the logged-only transport policy."""
+    if not getattr(args, "shadow_model", None):
+        return None, None
+    policy, contract = _load_policy(
+        args.shadow_model, args.device, not args.allow_unknown_model,
+        getattr(args, "shadow_contract", None),
     )
+    return RLController(policy), contract
 
 
 def parse_args(argv=None):
@@ -509,6 +572,45 @@ def parse_args(argv=None):
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--arm", default="/PSM1")
+    ap.add_argument("--contract", choices=sorted(_CONTRACT_NAMES),
+                    help="force a checkpoint contract instead of resolving it "
+                         "from the model's SHA256")
+    ap.add_argument("--suture-pos", nargs=3, type=float, default=None,
+                    metavar=("X", "Y", "Z"),
+                    help="TOOL position at the suturing point, metres, in the "
+                         "frame measured_cp reports. This is where the gripper "
+                         "goes, not where the needle goes.")
+    ap.add_argument("--suture-quat", nargs=4, type=float, default=None,
+                    metavar=("QX", "QY", "QZ", "QW"),
+                    help="tool orientation at the suturing point, i.e. the "
+                         "needle angle expressed as a gripper pose")
+    ap.add_argument("--suture-confirmed", action="store_true",
+                    help="required for --execute: a human has checked this pose "
+                         "against the scene")
+    ap.add_argument("--transport-via", choices=["lift_height", "direct"],
+                    default="lift_height")
+    ap.add_argument("--transport-clearance-cm", type=float, default=None)
+    ap.add_argument("--transport-max-steps", type=int, default=600)
+    ap.add_argument("--transport-success-trans-cm", type=float, default=0.3)
+    ap.add_argument("--transport-success-rot-deg", type=float, default=5.0)
+    ap.add_argument("--place-max-steps", type=int, default=400)
+    ap.add_argument("--place-success-trans-cm", type=float, default=0.2)
+    ap.add_argument("--place-success-rot-deg", type=float, default=3.0)
+    ap.add_argument("--on-approach-failure", choices=["hold", "servo"],
+                    default="hold",
+                    help="hold stops at the last command with the jaw untouched "
+                         "and waits for a human; servo finishes the approach "
+                         "geometrically and carries on")
+    ap.add_argument("--stage", action="store_true",
+                    help="servo to a pose inside the checkpoint's demonstrated "
+                         "support before handing over to the policy")
+    ap.add_argument("--stage-offset-tool-cm", nargs=3, type=float, default=None)
+    ap.add_argument("--stage-rotation-deg", type=float, default=None)
+    ap.add_argument("--stage-max-steps", type=int, default=400)
+    ap.add_argument("--shadow-model",
+                    help="a second checkpoint run alongside the transport and "
+                         "place legs, logged and never published")
+    ap.add_argument("--shadow-contract", choices=sorted(_CONTRACT_NAMES))
     ap.add_argument(
         "--grasp-pos", nargs=3, type=float, required=True, metavar=("X", "Y", "Z"),
         help="where to close the jaw, in metres, in the SAME frame as measured_cp",
@@ -712,6 +814,38 @@ def main(argv=None) -> int:
         frame=args.lift_frame,
         explicit=args.lift_sign is not None,
     )
+    if args.suture_pos is not None and args.suture_quat is None:
+        print("--suture-pos needs --suture-quat: the point of the leg is to "
+              "present the needle at an angle, so the orientation is the "
+              "payload.", file=sys.stderr)
+        rclpy.shutdown()
+        return 3
+
+    try:
+        controller, contract = build_controller(args)
+        shadow_controller, shadow_contract = build_shadow(args)
+    except (SystemExit, FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        rclpy.shutdown()
+        return 3
+
+    if args.stage and contract is None:
+        print("--stage needs a checkpoint contract to stage INTO. Pass --model "
+              "with --controller rl, or name one with --contract.",
+              file=sys.stderr)
+        rclpy.shutdown()
+        return 3
+
+    transport = None
+    if args.suture_pos is not None:
+        transport = TransportSpec(
+            via=args.transport_via,
+            via_clearance_m=(
+                None if args.transport_clearance_cm is None
+                else args.transport_clearance_cm / 100.0
+            ),
+        )
+
     plan = build_plan(
         start,
         args.grasp_pos,
@@ -720,6 +854,12 @@ def main(argv=None) -> int:
         goal_quat_xyzw=tuple(args.grasp_quat) if args.grasp_quat else None,
         lift=lift,
         jaw=jaw_cal,
+        suture_position_m=args.suture_pos,
+        suture_quat_xyzw=tuple(args.suture_quat) if args.suture_quat else None,
+        transport=transport,
+        stage_contract=contract if args.stage else None,
+        stage_offset_tool_cm=args.stage_offset_tool_cm,
+        stage_rotation_deg=args.stage_rotation_deg,
     )
 
     report = precheck(
@@ -735,8 +875,12 @@ def main(argv=None) -> int:
         max_step_rotation_deg=args.max_step_rotation_deg,
         approach_max_steps=args.approach_max_steps,
         lift_max_steps=args.lift_max_steps,
+        transport_max_steps=args.transport_max_steps,
+        place_max_steps=args.place_max_steps,
         success_trans_cm=args.lift_success_trans_cm,
         success_rot_deg=args.success_rot_deg,
+        suture_confirmed=args.suture_confirmed,
+        stage_contract=contract,
         strict=args.strict,
     )
     print(report.render())
@@ -748,6 +892,15 @@ def main(argv=None) -> int:
 
     cfg = SequenceConfig(
         frame_mode=args.frame_mode,
+        approach_contract=contract,
+        on_approach_failure=args.on_approach_failure,
+        stage_max_steps=args.stage_max_steps,
+        transport_max_steps=args.transport_max_steps,
+        transport_success_trans_cm=args.transport_success_trans_cm,
+        transport_success_rot_deg=args.transport_success_rot_deg,
+        place_max_steps=args.place_max_steps,
+        place_success_trans_cm=args.place_success_trans_cm,
+        place_success_rot_deg=args.place_success_rot_deg,
         approach_max_steps=args.approach_max_steps,
         approach_success_trans_cm=args.success_trans_cm,
         approach_success_rot_deg=args.success_rot_deg,
@@ -775,7 +928,8 @@ def main(argv=None) -> int:
     )
 
     sequencer = GraspLiftSequencer(
-        plan, build_controller(args), cfg, limits, baseline
+        plan, controller, cfg, limits, baseline,
+        shadow_controller=shadow_controller, shadow_contract=shadow_contract,
     )
     node = GraspLiftNode(node_args, plan, sequencer, jaw_cal)
     sequencer.confirm_callback = node._confirm_callback

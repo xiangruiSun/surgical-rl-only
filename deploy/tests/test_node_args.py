@@ -243,9 +243,9 @@ def test_jaw_calibration_flags_build_a_valid_calibration(node_module):
 def test_r6_support_is_a_warning_only_for_the_learned_policy(
     node_module, plan, baseline
 ):
-    """A WARN on a live arm should mean "consider stopping". The R6 trained
-    region does not bind the geometric servo, so under d2 it is logged as
-    information, matching what the precheck already says."""
+    """A WARN on a live arm should mean "consider stopping". A checkpoint's
+    trained region does not bind the geometric servo, so under d2 it is logged
+    as information, matching what the precheck already says."""
     node, sequencer = _build_node(
         node_module, plan, baseline, ["--grasp-pos", "0", "0", "0", "--lift-sign", "-1"]
     )
@@ -253,7 +253,7 @@ def test_r6_support_is_a_warning_only_for_the_learned_policy(
     node.start_episode(_FakeReport())
     levels = {
         level for level, msg in node.get_logger().lines
-        if "R6" in msg or "demonstration support" in msg
+        if "demonstration support" in msg
     }
     assert levels == {"info"}
 
