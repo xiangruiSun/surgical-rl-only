@@ -50,7 +50,7 @@ except ImportError as exc:  # pragma: no cover - only on a host without ROS
 from .controllers import D2Controller, RLController, ResidualController
 from .feasibility import precheck
 from .frames import Pose
-from .jaw import JawBaseline, JawCalibration
+from .jaw import JawBaseline, JawCalibration, JawCalibrationError
 from .loop import SafetyLimits
 from .plan import LiftSpec, build_plan
 from .sequence import (
@@ -402,6 +402,58 @@ class GraspLiftNode(Node):
 
 
 # ----------------------------------------------------------------------------
+def resolve_jaw_baseline(spec, *, grip_deg: float, arm: str = "/PSM1"):
+    """Load and sanity-check an empty-jaw baseline.
+
+    Returns ``(baseline, problem)``.  ``problem`` is a ready-to-print message
+    when the file cannot be trusted, in which case the run must not start: a
+    baseline recorded against a different grip angle, or in a dry run where the
+    jaw never actually moved, silently compares every later reading against the
+    wrong reference, which is worse than having no baseline at all.
+    """
+    if not spec:
+        return None, None
+
+    path = Path(spec).expanduser()
+    if not path.is_file():
+        return None, (
+            f"jaw baseline not found: {path}\n"
+            "Create it with an EMPTY gripper (the arm does not move):\n"
+            f"    python3 tools/calibrate_jaw.py --arm {arm} "
+            f"--jaw-grip-deg {grip_deg} --out {path} --execute\n"
+            "Or drop --jaw-baseline to run without one: jaw readings are then "
+            "logged raw, with no reference for what an empty close looks like."
+        )
+    try:
+        payload = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        return None, f"jaw baseline {path} is not valid JSON: {exc}"
+    if not isinstance(payload, dict):
+        return None, f"jaw baseline {path} should contain a JSON object"
+
+    try:
+        baseline = JawBaseline.from_dict(payload)
+    except JawCalibrationError as exc:
+        return None, f"jaw baseline {path} is unusable: {exc}"
+
+    if not payload.get("executed", True):
+        return None, (
+            f"jaw baseline {path} was recorded in a DRY RUN, so the jaw never "
+            "moved and the numbers describe wherever it already was. Re-run "
+            "tools/calibrate_jaw.py with --execute."
+        )
+
+    recorded = payload.get("grip_command_deg")
+    if recorded is not None and abs(float(recorded) - float(grip_deg)) > 0.5:
+        return None, (
+            f"jaw baseline {path} was recorded closing to {float(recorded):.1f} "
+            f"deg but this run commands {float(grip_deg):.1f} deg. Every "
+            "residual would be measured against the wrong reference. Re-record "
+            "it, or match --jaw-grip-deg to the baseline."
+        )
+    return baseline, None
+
+
 def build_controller(args):
     if args.controller == "d2":
         return D2Controller(staged=True)
@@ -538,11 +590,12 @@ def main(argv=None) -> int:
         grip_rad=float(np.deg2rad(args.jaw_grip_deg)),
         approach_open_rad=float(np.deg2rad(args.jaw_approach_open_deg)),
     )
-    baseline = None
-    if args.jaw_baseline:
-        baseline = JawBaseline.from_dict(
-            json.loads(Path(args.jaw_baseline).expanduser().read_text())
-        )
+    baseline, problem = resolve_jaw_baseline(
+        args.jaw_baseline, grip_deg=args.jaw_grip_deg, arm=args.arm
+    )
+    if problem:
+        print(problem, file=sys.stderr)
+        return 3
 
     rclpy.init()
     node_args = args

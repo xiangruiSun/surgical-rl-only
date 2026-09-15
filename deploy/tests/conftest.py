@@ -52,3 +52,101 @@ def baseline(jaw_cal):
         empty_close_effort_noise=0.005,
         source="test fixture",
     )
+
+
+# --- the ROS node, with rclpy stubbed so it imports on any host ---------
+import types  # noqa: E402
+
+
+@pytest.fixture(scope="session")
+def node_module():
+    stubs = {}
+
+    def stub(name, **attrs):
+        module = types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(module, key, value)
+        stubs[name] = module
+        return module
+
+    class _Logger:
+        def __init__(self):
+            self.lines = []
+
+        def info(self, msg):
+            self.lines.append(("info", msg))
+
+        def warn(self, msg):
+            self.lines.append(("warn", msg))
+
+        def error(self, msg):
+            self.lines.append(("error", msg))
+
+    class _Clock:
+        def now(self):
+            return types.SimpleNamespace(to_msg=lambda: None)
+
+    class _Node:
+        def __init__(self, *a, **k):
+            self._logger = _Logger()
+            self.published = []
+
+        def create_subscription(self, *a, **k):
+            return None
+
+        def create_publisher(self, *a, **k):
+            node = self
+
+            class _Pub:
+                def publish(self, msg):
+                    node.published.append(msg)
+
+            return _Pub()
+
+        def create_timer(self, *a, **k):
+            return None
+
+        def get_logger(self):
+            return self._logger
+
+        def get_clock(self):
+            return _Clock()
+
+        def destroy_node(self):
+            pass
+
+    class _QoS:
+        def __init__(self, depth=10):
+            self.depth = depth
+            self.reliability = None
+
+    rclpy = stub("rclpy", init=lambda *a, **k: None, shutdown=lambda: None,
+                 create_node=lambda *a, **k: None, spin_once=lambda *a, **k: None,
+                 ok=lambda: True)
+    rclpy.logging = types.SimpleNamespace(get_logger=lambda name: None)
+    stub("rclpy.node", Node=_Node)
+    stub("rclpy.qos", QoSProfile=_QoS,
+         ReliabilityPolicy=types.SimpleNamespace(
+             RELIABLE="reliable", BEST_EFFORT="best_effort"))
+    stub("geometry_msgs", )
+    stub("geometry_msgs.msg", PoseStamped=object)
+    stub("sensor_msgs", )
+    stub("sensor_msgs.msg", JointState=object)
+    stub("std_msgs", )
+    stub("std_msgs.msg", Bool=object)
+
+    saved = {k: sys.modules.get(k) for k in stubs}
+    sys.modules.update(stubs)
+    sys.modules.pop("surgicai_rl_deploy.grasp_lift_node", None)
+    from surgicai_rl_deploy import grasp_lift_node as module
+
+    yield module
+
+    sys.modules.pop("surgicai_rl_deploy.grasp_lift_node", None)
+    for key, value in saved.items():
+        if value is None:
+            sys.modules.pop(key, None)
+        else:
+            sys.modules[key] = value
+
+
