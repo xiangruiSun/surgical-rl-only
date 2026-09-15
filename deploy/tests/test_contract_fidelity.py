@@ -335,3 +335,48 @@ def test_defaults_are_the_faithful_ones():
 def test_bad_fidelity_settings_are_rejected(field, value):
     with pytest.raises(ValueError):
         LoopConfig(**{field: value})
+
+
+# ======================================================================
+# the per-step cap measures the command, not the gap to the arm
+# ======================================================================
+def test_the_step_cap_is_measured_against_the_previous_command():
+    """A lagging arm must not drag the command back toward itself.
+
+    With an open-loop observation the command legitimately runs ahead of the
+    arm.  Capping each step against the *measured* pose then fires every cycle
+    and pulls the command back -- which is the closed loop the open-loop
+    contract exists to remove, reintroduced through the safety layer.  On a
+    mock arm closing half the gap per cycle this alone aborted a policy run
+    that otherwise succeeds.
+    """
+    action = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    frozen = Pose.from_vec7(START)
+    limits = SafetyLimits(max_step_translation_mm=1.0, max_consecutive_clamps=0,
+                          max_tracking_error_cm=1000.0, workspace_pad_cm=1000.0)
+
+    loop = _loop(ConstantAction(action))
+    loop.limits = limits
+    positions = []
+    for _ in range(6):
+        positions.append(loop.step(frozen).command.p[0])
+    # each command advances by the full 1 mm cap, away from the stuck arm
+    steps = np.diff(positions) * 1000.0
+    np.testing.assert_allclose(steps, 1.0, atol=1e-6)
+
+
+def test_the_measured_reference_is_still_available():
+    action = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    frozen = Pose.from_vec7(START)
+    limits = SafetyLimits(max_step_translation_mm=1.0, max_consecutive_clamps=0,
+                          max_tracking_error_cm=1000.0, workspace_pad_cm=1000.0,
+                          step_reference="measured")
+    loop = _loop(ConstantAction(action))
+    loop.limits = limits
+    positions = [loop.step(frozen).command.p[0] for _ in range(6)]
+    # pinned 1 mm from the stuck arm, for ever
+    np.testing.assert_allclose(np.diff(positions), 0.0, atol=1e-9)
+
+
+def test_command_reference_is_the_default():
+    assert SafetyLimits().step_reference == "command"

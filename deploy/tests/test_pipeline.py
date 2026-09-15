@@ -353,10 +353,11 @@ def test_the_shadow_runs_but_never_commands(start_pose, jaw_cal, baseline):
     assert seq.shadow_log
     summary = seq.shadow_summary()
     assert summary["cycles"] == len(seq.shadow_log)
-    # a shadow that returns zero actions goes nowhere, so the real run must
-    # have ended somewhere the shadow did not
-    assert summary["reached_goal"] is False
-    # the real arm still arrived
+    # a shadow returning zero actions proposes "stay where you are", so its
+    # advice diverges from the servo's by exactly one servo step, every cycle
+    assert summary["median_divergence_mm"] > 0.0
+    assert summary["support"] is not None
+    # and the real arm still arrived, because the shadow never commanded
     assert np.linalg.norm(steps[-1].measured.pose.p - plan.suture.p) * 100.0 < 0.3
 
 

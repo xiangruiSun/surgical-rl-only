@@ -430,12 +430,15 @@ def main(argv=None) -> int:
               f"(reached={summary['reached_suture_pose']})")
     if summary.get("shadow"):
         sh = summary["shadow"]
-        print(f"shadow      : closest {sh['closest_trans_cm']:.2f} cm, "
-              f"would have reached the goal: {sh['reached_goal']}, "
-              f"median divergence from the commanded pose "
-              f"{sh['median_divergence_mm']:.2f} mm"
-              if sh["median_divergence_mm"] is not None else
-              f"shadow      : closest {sh['closest_trans_cm']:.2f} cm")
+        print(f"shadow      : {sh['cycles']} cycles of one-step advice; "
+              f"divergence from what was commanded: median "
+              f"{(sh['median_divergence_mm'] or 0.0):.2f} mm / "
+              f"{(sh['median_divergence_deg'] or 0.0):.2f} deg, max "
+              f"{(sh['max_divergence_mm'] or 0.0):.2f} mm; "
+              f"{sh['cycles_clamped']} cycles clamped")
+        if sh.get("support") and not sh["support"].get("in_distribution"):
+            for line in sh["support"]["out_of_distribution"]:
+                print(f"              out of distribution: {line}")
 
     if args.json_out:
         Path(args.json_out).write_text(

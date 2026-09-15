@@ -104,7 +104,8 @@ def _build_node(node_module, plan, baseline, argv):
     args = node_module.parse_args(argv)
     sequencer = GraspLiftSequencer(
         plan, D2Controller(staged=True),
-        SequenceConfig(grasp_gate="always"), SafetyLimits(), baseline,
+        SequenceConfig(grasp_gate="always"), node_module.build_limits(args),
+        baseline,
     )
     node = node_module.GraspLiftNode(args, plan, sequencer, plan.jaw)
     node._measured = (plan.start.p, plan.start.quat_xyzw())

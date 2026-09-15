@@ -53,10 +53,25 @@ class SafetyLimits:
 
     #: box padding, in cm, around the axis-aligned box spanned by start+goal
     workspace_pad_cm: float = 2.0
-    #: largest translation between the measured pose and the new command
+    #: largest translation between consecutive commands
     max_step_translation_mm: float = 2.5
-    #: largest rotation between the measured pose and the new command
+    #: largest rotation between consecutive commands
     max_step_rotation_deg: float = 5.0
+    #: what the per-step caps are measured against.
+    #:
+    #: ``"command"`` -- the previous command. This bounds how fast the
+    #: *commanded trajectory* moves, which is the thing a per-step cap is for.
+    #: ``"measured"`` -- the arm's current pose, which was the original
+    #: behaviour and is wrong under the open-loop observation contract: a
+    #: lagging arm makes the command legitimately run ahead of it, the cap
+    #: fires every cycle, and the clamp quietly drags the command back toward
+    #: the arm -- which is the closed loop we removed, reintroduced through the
+    #: safety layer. Measured on a mock arm closing half the gap per cycle,
+    #: this alone aborted a policy run that succeeds with "command".
+    #:
+    #: How far the arm may fall *behind* is a separate question, and
+    #: ``max_tracking_error_cm`` below is what answers it.
+    step_reference: str = "command"
     #: abort if the arm lags this far behind the previous command
     max_tracking_error_cm: float = 1.5
     #: abort if measured_cp goes stale (ROS node only)
@@ -372,11 +387,19 @@ class ApproachLoop:
             )
             p = boxed
 
-        delta = p - measured.p
+        # Per-step caps bound the commanded trajectory, not the gap to the arm;
+        # see SafetyLimits.step_reference.
+        reference = (
+            self.last_command
+            if self.limits.step_reference == "command" and self.last_command is not None
+            else measured
+        )
+
+        delta = p - reference.p
         norm = float(np.linalg.norm(delta))
         max_step = self.limits.max_step_translation_mm / 1000.0
         if norm > max_step:
-            p = measured.p + delta * (max_step / norm)
+            p = reference.p + delta * (max_step / norm)
             clamps.append(
                 {"kind": "step_translation", "proposed_mm": norm * 1000.0,
                  "applied_mm": max_step * 1000.0}
@@ -384,13 +407,15 @@ class ApproachLoop:
 
         from scipy.spatial.transform import Rotation
 
-        rel = Rotation.from_matrix(measured.R.T @ command.R)
+        rel = Rotation.from_matrix(reference.R.T @ command.R)
         rotvec = rel.as_rotvec()
         angle = float(np.linalg.norm(rotvec))
         max_rot = np.deg2rad(self.limits.max_step_rotation_deg)
         R_cmd = command.R
         if angle > max_rot:
-            R_cmd = measured.R @ Rotation.from_rotvec(rotvec * (max_rot / angle)).as_matrix()
+            R_cmd = reference.R @ Rotation.from_rotvec(
+                rotvec * (max_rot / angle)
+            ).as_matrix()
             clamps.append(
                 {"kind": "step_rotation", "proposed_deg": np.degrees(angle),
                  "applied_deg": self.limits.max_step_rotation_deg}

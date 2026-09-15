@@ -282,6 +282,7 @@ class GraspLiftSequencer:
         self.shadow_contract = shadow_contract
         self._shadow_loop: Optional[ApproachLoop] = None
         self.shadow_log: list = []
+        self.shadow_support: Optional[dict] = None
         self.limits = limits or SafetyLimits()
         self.baseline = jaw_baseline
         self.confirm_callback = confirm_callback
@@ -478,6 +479,15 @@ class GraspLiftSequencer:
                 float(np.deg2rad(30.0)) if contract is None
                 else contract.success_rot_rad
             ),
+            # A shadow is a one-step advisor, not a rollout: at each pose the
+            # arm actually reached, what would this policy have commanded next?
+            # So its observation comes from the measured pose. A free-running
+            # integrator would be answering a question about a trajectory that
+            # never happened -- and that counterfactual is better run offline
+            # from the logged start with tools/replay_demos.py, where it can be
+            # repeated and varied.
+            observation_source="measured",
+            integrate_policy_jaw=False,
             **({} if contract is None
                else {"step_size": np.asarray(contract.step_size, dtype=np.float64),
                      "policy_jaw_start": float(contract.demo_start_jaw)}),
@@ -492,20 +502,16 @@ class GraspLiftSequencer:
             self._shadow_loop = None
             return
         self._shadow_loop = loop
+        self.shadow_support = {
+            "in_distribution": report.get("in_distribution"),
+            "out_of_distribution": report.get("out_of_distribution") or [],
+        }
         events.append({"i": self.index, "event": "shadow_begin",
                        "controller": self.shadow_controller.describe(),
-                       "in_distribution": report.get("in_distribution"),
-                       "out_of_distribution": report.get("out_of_distribution")})
+                       **self.shadow_support})
 
     def _shadow_step(self, measured: ArmState, events: list):
-        """Run the shadow controller on this cycle and record what it wanted.
-
-        It is fed the *measured* pose every cycle, not its own integrator,
-        because the question being asked is counterfactual -- "from where the
-        arm actually is, what would this policy have done next" -- and a free
-        integrator would answer a question about a trajectory that never
-        happened.  The answer is logged and discarded.
-        """
+        """Ask the shadow what it would command from here, and write it down."""
         if self._shadow_loop is None:
             return
         try:
@@ -515,49 +521,54 @@ class GraspLiftSequencer:
                            "error": f"{type(exc).__name__}: {exc}"})
             self._shadow_loop = None
             return
+
         real = self._last_command
-        divergence_mm = (
-            None if real is None
-            else float(np.linalg.norm(result.command.p - real.pose.p) * 1000.0)
-        )
+        divergence_mm = divergence_deg = None
+        if real is not None:
+            divergence_mm = float(
+                np.linalg.norm(result.command.p - real.pose.p) * 1000.0
+            )
+            divergence_deg = float(
+                np.degrees(rotation_error_rad(result.command, real.pose))
+            )
         self.shadow_log.append({
             "i": self.index,
             "phase": self.phase,
             "action": np.asarray(result.action, dtype=float).round(4).tolist(),
             "proposed_cm": (result.command.p * 100.0).tolist(),
-            "trans_err_cm": result.trans_err_cm,
-            "rot_err_deg": result.rot_err_deg,
             "divergence_from_commanded_mm": divergence_mm,
-            "would_have_finished": result.reason,
+            "divergence_from_commanded_deg": divergence_deg,
+            "clamped": [c["kind"] for c in result.clamps],
         })
-        if result.done:
-            events.append({"i": self.index, "event": "shadow_finished",
-                           "reason": result.reason,
-                           "trans_err_cm": result.trans_err_cm,
-                           "rot_err_deg": result.rot_err_deg})
+        # A one-step advisor cannot finish anything, so the loop's own
+        # termination is ignored -- except for a clamp abort, which means its
+        # advice had stopped being usable and is worth recording once.
+        if result.done and "clamp" in result.reason:
+            events.append({"i": self.index, "event": "shadow_unusable",
+                           "reason": result.reason})
             self._shadow_loop = None
 
     def shadow_summary(self) -> Optional[dict]:
         if not self.shadow_log:
             return None
-        div = [r["divergence_from_commanded_mm"] for r in self.shadow_log
-               if r["divergence_from_commanded_mm"] is not None]
-        closest = min(r["trans_err_cm"] for r in self.shadow_log)
+        mm = [r["divergence_from_commanded_mm"] for r in self.shadow_log
+              if r["divergence_from_commanded_mm"] is not None]
+        deg = [r["divergence_from_commanded_deg"] for r in self.shadow_log
+               if r["divergence_from_commanded_deg"] is not None]
         return {
             "cycles": len(self.shadow_log),
-            "closest_trans_cm": closest,
-            "final_trans_cm": self.shadow_log[-1]["trans_err_cm"],
-            "final_rot_deg": self.shadow_log[-1]["rot_err_deg"],
-            "median_divergence_mm": float(np.median(div)) if div else None,
-            "max_divergence_mm": float(np.max(div)) if div else None,
-            "reached_goal": any(
-                r["would_have_finished"] == "success" for r in self.shadow_log
-            ),
+            "median_divergence_mm": float(np.median(mm)) if mm else None,
+            "max_divergence_mm": float(np.max(mm)) if mm else None,
+            "median_divergence_deg": float(np.median(deg)) if deg else None,
+            "max_divergence_deg": float(np.max(deg)) if deg else None,
+            "cycles_clamped": sum(1 for r in self.shadow_log if r["clamped"]),
+            "support": getattr(self, "shadow_support", None),
             "note": (
-                "This controller never held the needle. The numbers say what it "
-                "would have commanded from the poses the arm actually visited, "
-                "which is not the same as what would have happened had it been "
-                "driving -- it would have visited different poses."
+                "One-step advice at the poses the arm actually visited: at each "
+                "cycle, what this controller would have commanded next. It is "
+                "NOT a rollout -- had it been driving, the arm would have been "
+                "somewhere else. For the counterfactual, replay it offline from "
+                "the logged transport start with tools/replay_demos.py."
             ),
         }
 

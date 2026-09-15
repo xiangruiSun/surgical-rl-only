@@ -535,6 +535,24 @@ def _load_policy(path, device, verify, named_contract=None):
     return policy, contract
 
 
+def build_limits(args) -> SafetyLimits:
+    """The safety envelope for a run, including the dry-run exception.
+
+    In a *static* dry run nothing is published, so the arm cannot follow and
+    the tracking guard would be reporting the dry run itself as a fault. It is
+    the one case where the guard is meaningless rather than merely quiet.
+    """
+    tracking = args.max_tracking_error_cm
+    if not args.execute and not getattr(args, "dry_run_simulate", True):
+        tracking = float("inf")
+    return SafetyLimits(
+        workspace_pad_cm=args.workspace_pad_cm,
+        max_step_translation_mm=args.max_step_translation_mm,
+        max_step_rotation_deg=args.max_step_rotation_deg,
+        max_tracking_error_cm=tracking,
+    )
+
+
 def build_controller(args):
     """Return ``(controller, contract)`` for the approach leg."""
     if args.controller == "d2":
@@ -920,12 +938,7 @@ def main(argv=None) -> int:
         goal_rpy_train=tuple(args.goal_rpy_train) if args.goal_rpy_train else None,
         unwrap_rpy=not args.no_unwrap_rpy,
     )
-    limits = SafetyLimits(
-        workspace_pad_cm=args.workspace_pad_cm,
-        max_step_translation_mm=args.max_step_translation_mm,
-        max_step_rotation_deg=args.max_step_rotation_deg,
-        max_tracking_error_cm=args.max_tracking_error_cm,
-    )
+    limits = build_limits(args)
 
     sequencer = GraspLiftSequencer(
         plan, controller, cfg, limits, baseline,
