@@ -1,9 +1,20 @@
 # SurgicAI Approach — RL deployment on a real dVRK PSM
 
-> **Grasping and lifting now live in [`README_GRASP_LIFT.md`](README_GRASP_LIFT.md)**
-> (`run_grasp_lift.py`): approach → close the jaw → observe → lift 1.5 cm, with
-> a fail-closed precheck and an operator gate. This file still describes the
-> approach-only path (`run_approach.py`), which is unchanged.
+> **The full pipeline now lives in [`README_GRASP_LIFT.md`](README_GRASP_LIFT.md)**
+> (`run_pipeline.py`): stage → approach → close the jaw → observe → lift →
+> transport → place the needle at the suturing point, with a fail-closed
+> precheck and an operator gate. This file still describes the approach-only
+> path (`run_approach.py`).
+>
+> **Three contract defects were found and fixed since this file was written,
+> and they invalidate the RL comparisons below.** The RPY roll branch, the
+> action scale (there are two, and the recoverable one is the wrong one), and a
+> closed-loop observation where training was open-loop. With all three fixed
+> the upstream Approach checkpoint reproduces 45/50 of its own demonstration
+> episodes through this loop, against a published 96% ± 6%. See the "RPY branch
+> defect", "two action scales" and "observation was closed-loop" sections of
+> the grasp-lift guide, and re-measure with `tools/replay_demos.py` before
+> citing any RL number from this page.
 
 
 Runs the released `r6_unified_single_goal_yaw15_seed1_final.zip` checkpoint (or

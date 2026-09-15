@@ -1,28 +1,48 @@
-# Grasp and lift on a real dVRK PSM
+# The suturing pipeline on a real dVRK PSM
 
-Extends the approach deployment to the full **approach → close the jaw →
-observe → lift 1.5 cm** sequence, on real hardware, with no AMBF and no
-perception stack. The only inputs are still two poses: a start pose read from
-the arm and a grasp position given on the command line.
+**stage → approach → settle → close the jaw → observe → lift → transport →
+place**, on real hardware, with no AMBF and no perception stack.
+
+The task is described by three tool poses in the frame `measured_cp` reports:
+
+| | |
+|---|---|
+| start | read from the arm; you do not pass it |
+| grasp | where the **gripper** must be to take the needle |
+| suture | where the **gripper** must be for the needle to sit correctly angled at the entry point |
+
+All three are *tool* poses. After a blind grasp the needle-in-jaw transform is
+unknown, so a needle-frame target could not be turned into a command, and this
+deployment never pretends otherwise.
+
+The phases are driven off the plan, so the same code runs a bare grasp-and-lift
+(no suturing pose) or the full pipeline, and Insert or Pullout drop in as two
+more segments whenever someone decides that is a safe thing to do.
 
 ```
-run_grasp_lift.py            ROS 2 entry point for the whole sequence
-run_approach.py              unchanged: approach only, as before
+run_pipeline.py              ROS 2 entry point for the whole pipeline
+run_grasp_lift.py            the same node; grasp and lift only
+run_approach.py              approach only, as before
 surgicai_rl_deploy/
+  contract.py                per-checkpoint action scale, tolerance, support
   sequence.py                the phase state machine (no ROS, no torch)
+  staging.py                 solve a start pose inside a policy's own support
   jaw.py                     jaw radians <-> normalised jaw, and grasp *evidence*
-  plan.py                    start / grasp / lifted geometry
+  plan.py                    start / staged / grasp / lifted / via / suture
   feasibility.py             the fail-closed precheck
   grasp_lift_node.py         topics, dry run, operator gate, JSONL trace
   mock.py                    kinematic arm + jaw model for offline replay
-  loop.py, obs.py, ...       unchanged from the approach deployment
+  loop.py, obs.py, ...       the policy loop and observation builder
 tools/
   calibrate_jaw.py           what an empty close looks like on YOUR arm
-  offline_grasp_lift.py      replay the whole sequence with no robot
-  plan_r6_start.py           solve a start pose inside the RL policy's support
+  offline_grasp_lift.py      rehearse the whole pipeline with no robot
+  replay_demos.py            does a checkpoint work through THIS loop?
+  profile_checkpoint.py      read a checkpoint's training support off its demos
+  recover_step_size.py       the scale the demonstrations integrate at
+  plan_r6_start.py           solve a staging pose (CLI over staging.py)
   sweep_r6_support.py        does the policy work anywhere in that support?
-  recover_step_size.py       recover the action scale from a checkpoint's demos
-tests/                       189 tests, no ROS or robot required
+  fetch_upstream_checkpoints.sh   pull the released SurgicAI checkpoints
+tests/                       272 tests, no ROS, robot or checkpoint required
 ```
 
 ---
@@ -116,43 +136,91 @@ after matrix round-trip: [ 2.509  0.497  1.317]     difference: exactly 2π
 
 Every cycle re-derived RPY from the measured rotation matrix, so three of the
 twenty-one observation dimensions arrived on a branch no policy was trained on.
-Observations are now unwrapped onto the training branch (`unwrap_rpy`, on by
-default; `--no-unwrap-rpy` restores the old behaviour for A/B).
 
-Measured effect, replaying the upstream checkpoint against its own stored
-demonstrations, in the training frame, at the recovered step size:
+The fix is no longer a heuristic. `RL/subtask_env.py :: Frame2Vec(bound=True)`
+says exactly what the branch is:
 
-| | demos reproduced |
-|---|---|
-| canonical RPY (before) | **0 / 20** |
-| unwrapped onto the training branch | **14 / 20**, median 114 steps |
+```python
+roll, pitch, yaw = frame.M.GetRPY()
+if roll <= np.deg2rad(-360):  roll += 2*np.pi
+elif roll > np.deg2rad(0):    roll -= 2*np.pi
+```
+
+Roll lives in **(−2π, 0]**; pitch and yaw are left exactly as `GetRPY` returned
+them. `frames.bound_roll()` is a transcription of that, and it reproduces
+**50/50** stored goal rolls and **50/50** stored start rolls in the upstream
+Approach checkpoint without being told the branch. Both released checkpoints
+have 100% of their goal rolls outside ±π and 0% outside (−2π, 0].
 
 `verify_contract.py` passed throughout because it rebuilds observations from the
 stored 7-vectors and never round-trips a matrix — exactly the gap. It now checks
 the round trip too. The D2 servo was never affected: it uses only *relative*
 rotation, where a common 2π offset cancels.
 
-## The action scale is recoverable, not a matter of belief
+## There are two action scales and it is easy to take the wrong one
 
-`STEP_SIZE_RAW` was read out of the training sources and never verified — the
-contract check covers observations, which never touch it. But the embedded
-demonstrations contain the actions *and* the states they produced, so
+`STEP_SIZE_RAW` was read out of the training sources and never verified. When
+it finally was, the answer turned out to have two halves:
+
+| source | Approach | what it is |
+|---|---|---|
+| `RL/Env_info/Approach_noise_env_info` | 0.5 mm / 2° | the scale the **demonstrations** integrate at |
+| `RL/RL_training_online.py`, `RL/Model_evaluation.py` | **1.0 mm / 3°**, 300 steps | the scale the **policy** was trained and evaluated at |
+
+`tools/recover_step_size.py` fits the first, exactly, to numerical zero — and
+that is the wrong number to drive the policy with. Replaying the upstream
+Approach checkpoint from its own demonstration starts, in the training frame,
+against a perfect arm:
 
 ```
-achieved[t+1] = achieved[t] + action[t] · step_size
+0.5 mm / 2 deg  (the demonstration scale)     7/20    35%
+1.0 mm / 3 deg  (the training scale)         19/20    95%     published: 96% ± 6%
 ```
 
-can be solved directly. `tools/recover_step_size.py` does that:
+So use `tools/replay_demos.py`, which runs the policy, rather than a curve fit
+against its training data:
 
 ```bash
-python3 tools/recover_step_size.py --model <checkpoint>
+python3 tools/replay_demos.py --model <checkpoint> --compare
 ```
 
-On the upstream Approach checkpoint it recovers **0.5 mm / 2° / 0.05** to zero
-residual across 5 928 samples, against the 1.5 mm / 3° this package applied —
-3× the translation and 1.5× the rotation. Run it on any checkpoint before
-trusting `--controller rl`, and pass `--trans-step-mm` / `--angle-step-deg` /
-`--jaw-step` if it disagrees.
+## The observation was closed-loop and training's was not
+
+`subtask_env.step` feeds the network `psm_goal_list` — the **integrated
+command** — and never reads `measured_cp` back inside a subtask. The policy is
+open-loop within an episode. This package fed it the measured pose.
+
+A perfect arm hides the difference completely. A first-order arm does not:
+
+| arm tracking per cycle | `obs=command` | `obs=measured` |
+|---|---|---|
+| 1.0 (perfect) | 25/25, 100% | 25/25, 100% |
+| 0.5 | 25/25, 100% | 21/25, 84% |
+| 0.3 | 25/25, 100% | **6/25, 24%** |
+
+That is the hardware failure mode this project spent weeks chasing. The
+observation now comes from an internal integrator seeded once from the staged
+pose (`observation_source="command"`, the default); the measured pose is used
+for the tracking-lag guard, the slip watch and the success test, and nothing
+else. Geometric servo segments keep the closed-loop observation, which is what
+a servo is for.
+
+Because the integrator is seeded once and never re-derived from a rotation
+matrix, the branch defect above cannot recur mid-episode either. The two fixes
+are the same fix seen from two sides.
+
+## What the published success rates were measured at
+
+Every env class in SurgicAI carries `threshold = [0.5, np.deg2rad(30)]`, and
+`Model_evaluation.py` takes the threshold from the command line without
+recording what was passed. At **0.5 cm / 30°** this loop reproduces Approach
+25/25 and Place 22/25, against published 96% ± 6% and 97% ± 9%. At
+`Env_info`'s tighter 10° the same runs give 23/25 and 12/25.
+
+Read that carefully before trusting a policy to place a needle: **Place is
+certified to thirty degrees of orientation error.** It is not a precision
+orientation controller, whatever "angle the needle correctly" needs it to be.
+Both tolerances are recorded per contract (`success_*` and `env_info_*`).
 
 ---
 
@@ -233,12 +301,30 @@ lift stay on the geometric servo regardless of what drives the approach.
 
 | phase | what happens | how it ends |
 |---|---|---|
-| `approach` | the existing, contract-verified `ApproachLoop` with `rl` / `d2` / `residual`, jaw held open | within tolerance of the grasp pose |
+| `stage` | servo to the pose that puts the approach policy inside its own demonstrated support. Skipped without `--stage`. | within tolerance of the staging pose; failure means the policy is never started at all |
+| `approach` | the contract-verified `ApproachLoop` with `rl` / `d2` / `residual`, jaw held open | within tolerance of the grasp pose |
 | `settle` | station-keep and require the measured pose to stop **drifting** | `settle_steps` clean cycles, or timeout → abort |
 | `close` | ramp the jaw 3°/cycle to the squeeze angle, still station-keeping | ramp complete + dwell |
 | `observe` | hold everything still and watch the jaw | `observe_steps` cycles, then the gate |
 | `lift` | translate 1.5 cm, orientation frozen, jaw held squeezed | within 2 mm of the lift pose |
-| `hold` | station-keep, take a final reading | `hold_steps` cycles → done |
+| `transport` | carry the needle to a point one lift-distance **above** the suturing pose, turning the wrist on the way. Never descends. Skipped without `--suture-pos`. | within tolerance of the via point |
+| `place` | descend onto the suturing pose with the orientation already correct | within 2 mm / 3° of the suturing pose |
+| `hold` | station-keep wherever the run ended, take a final reading | `hold_steps` cycles → done |
+
+The transport goes over the top rather than straight there because a straight
+line from the lift pose to an entry point can pass **below** the tissue plane in
+the middle while carrying a needle. `--transport-via direct` is available and
+the precheck warns about it. SurgicAI's own `Place_env.mid_goal_evaluator` uses
+the same idea: a raised waypoint 3.5 cm before the entry.
+
+Losing jaw evidence during the transport or the descent **stops and holds**; it
+does not lower. Lowering is the right answer above the pickup point and the
+wrong one halfway to the entry point.
+
+If the approach policy does not converge, the default `--on-approach-failure
+hold` stops at the last command with the jaw untouched and waits for a person.
+`servo` finishes the approach geometrically and carries on, which is what an
+unattended run wants and a first run does not.
 
 The settle phase compares the mean pose over the last N cycles against the mean
 over the N before it. A per-cycle motion test looks sensible and is wrong: on an
@@ -248,8 +334,33 @@ below any useful threshold, and a perfectly stationary arm times out. Raise
 message prints the measured drift so you can pick a number rather than guess.
 
 **On abort the last command is held and the jaw is never opened.** A gripper
-that may be holding a needle 1.5 cm above the tissue does not get opened
-automatically. Take manual control.
+that may be holding a needle above the tissue does not get opened
+automatically. Take manual control. The cycle that ends a run issues no fresh
+command at all — the arm keeps tracking the pose it was already given.
+
+## The shadow controller
+
+`--shadow-model <checkpoint>` runs a second policy alongside the transport and
+place legs, on the poses the arm actually visits, and **logs what it would have
+commanded without ever publishing it**. That is how to answer "would the
+SurgicAI Place policy have worked here" without letting it hold a needle.
+
+On the recorded geometry for this task it answers plainly: the Place checkpoint
+reports itself out of distribution the moment the transport begins —
+
+```
+tool-z +1.48 cm outside [-1.40, -1.17]
+start->goal rotation 65.4 deg outside [94.0, 136.2]
+```
+
+— and then diverges into the clamp guard, 1.28 cm from the goal. The servo
+carried the needle to 0.002 cm in the same run.
+
+The shadow is fed the measured pose rather than its own integrator, because the
+question is counterfactual: *from where the arm actually is, what would this
+policy do next*. Had it been driving it would have visited different poses, so
+the numbers are evidence, not a simulation. A shadow that throws is disabled and
+recorded; it can never take down the run.
 
 ---
 
@@ -299,12 +410,18 @@ python3 tools/offline_grasp_lift.py \
   --start-pos  -0.05639860616831881 0.03366166453830251 0.024455994074878362 \
   --start-quat  0.23319925218484056 0.4267863636861243 -0.23588767438897446 0.841325450478807 \
   --grasp-pos  -0.050726357 0.015332369 0.049514053 \
+  --suture-pos -0.040 0.005 0.040 --suture-quat 0 0 0 1 --suture-confirmed \
   --controller d2 --lift-sign -1 --grasp-gate evidence --verbose
 ```
 
 Rehearse the failures too — `--empty-gripper`, `--drop-at-step N`,
-`--no-jaw-effort`, `--lag 0.6 --noise-mm 0.3`. On the recorded numbers the
-clean run finishes in ~89 cycles and ends 1.50 cm above the grasp pose.
+`--no-jaw-effort`, `--lag 0.6 --noise-mm 0.3`, `--transport-via direct`. On the
+recorded numbers the clean pipeline finishes in ~126 cycles and ends 0.002 cm
+from the suturing pose.
+
+To put the RL policy on the approach leg, add `--controller rl --model <zip>
+--stage`; to measure the Place policy without letting it drive, add
+`--shadow-model <Place zip>`.
 
 ### 2. Dry run on the robot
 
@@ -312,15 +429,16 @@ Publishes nothing. Reads `measured_cp` and `jaw/measured_js`, runs the
 precheck, and logs every command it *would* send.
 
 ```bash
-python3 run_grasp_lift.py \
-  --grasp-pos -0.050726357 0.015332369 0.049514053 \
+python3 run_pipeline.py \
+  --grasp-pos  -0.050726357 0.015332369 0.049514053 \
+  --suture-pos -0.040 0.005 0.040 --suture-quat 0 0 0 1 \
   --jaw-baseline jaw_baseline.json --trace dryrun.jsonl
 ```
 
 Check in the log that `frame` is `ECM`, that `start` matches
-`ros2 topic echo /PSM1/measured_cp --once`, that the lift target is where you
-expect, and that `jaw/measured_js` is actually publishing (and whether it
-carries an `effort` field).
+`ros2 topic echo /PSM1/measured_cp --once`, that the lift target and the
+suturing pose are where you expect, and that `jaw/measured_js` is actually
+publishing (and whether it carries an `effort` field).
 
 A dry run publishes nothing, so the arm cannot move. By default the dry run
 therefore **simulates** a perfect arm landing on each command and walks the
@@ -347,8 +465,9 @@ motion, the real jaw commands and the real lift with nothing to drop.
 ### 4. Live, with a human on the gate
 
 ```bash
-python3 run_grasp_lift.py \
-  --grasp-pos -0.050726357 0.015332369 0.049514053 \
+python3 run_pipeline.py \
+  --grasp-pos  -0.050726357 0.015332369 0.049514053 \
+  --suture-pos -0.040 0.005 0.040 --suture-quat 0 0 0 1 --suture-confirmed \
   --controller d2 --interface move_cp --rate 2 \
   --lift-sign -1 --jaw-baseline jaw_baseline.json \
   --grasp-gate manual --trace live.jsonl --execute
@@ -356,10 +475,23 @@ python3 run_grasp_lift.py \
 
 The arm approaches, closes the jaw, stops, prints what it saw, and waits. Type
 `y` + Enter to lift or `n` + Enter to stop — or publish on `--confirm-topic`.
+If it lifts, it then carries the needle over to the suturing point and descends.
 
-`--lift-sign` is **required** for `--execute`: the precheck refuses a live run
-without it. `+z` in the ECM frame is not guaranteed to be away from the tissue,
-and a wrong sign drives the needle into the pad. Check it in the scene.
+Two flags are **required** for `--execute` and the precheck refuses a live run
+without them:
+
+- `--lift-sign`: `+z` in the ECM frame is not guaranteed to be away from the
+  tissue, and a wrong sign drives the needle into the pad.
+- `--suture-confirmed`, whenever `--suture-pos` is given: that pose is where the
+  **gripper** goes. Where the needle ends up also depends on how it sits in the
+  jaws, which nothing in this package measures. Somebody has to have looked at
+  the scene.
+
+The most reliable way to get a suturing pose is to teach it: jog the arm by
+hand until the needle sits correctly at the entry point, read
+`ros2 topic echo /PSM1/measured_cp --once`, and pass that back. Then the pose
+is a measurement rather than an estimate, and the needle-in-jaw transform it
+implicitly encodes is the one you actually have.
 
 Start with `--interface move_cp --rate 2`; `servo_cp` streams raw setpoints
 with no trajectory smoothing. Keep a hand on the e-stop — everything here is
@@ -432,12 +564,28 @@ why the real run makes you state it.
 ## Tests
 
 ```bash
-python3 -m pytest tests -q        # 189 tests, no ROS and no robot
+python3 -m pytest tests -q        # 272 tests, no ROS, robot or checkpoint
 ```
 
-Covers the jaw mapping and evidence logic, the lift geometry, every precheck
-branch, every phase transition and abort path, the safety envelope, the
-sim/real bridge, and regression guards on the approach contract
-(`STEP_SIZE_RAW`, the 21-dim observation layout, `cmd = measured + action *
-step`, and the recorded D2 result) so that adding grasp and lift cannot quietly
-change the approach.
+Covers the jaw mapping and evidence logic, the plan geometry including the via
+point, the staging solver and its frame invariance, every precheck branch,
+every phase transition and abort path, the safety envelope, the shadow
+controller (including one that throws), the sim/real bridge, both command
+lines, and the three contract defects:
+
+- `bound_roll` against a transcription of `Frame2Vec(bound=True)`
+- the acting scale kept distinct from the demonstration scale
+- the open-loop integrator, pinned against a stuck arm that must not be able to
+  move the policy's belief about where the tool is
+
+plus the older regression guards on the approach contract, so none of this can
+quietly change the approach.
+
+The numbers quoted throughout this document come from `tools/replay_demos.py`
+against the released checkpoints; reproduce them with
+
+```bash
+bash tools/fetch_upstream_checkpoints.sh
+python3 tools/replay_demos.py --model ../models/rl/upstream/approach_td3_her_bc.zip --compare
+python3 tools/replay_demos.py --model ../models/rl/upstream/approach_td3_her_bc.zip --arm-alpha 0.3 --compare
+```
