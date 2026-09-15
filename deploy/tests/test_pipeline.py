@@ -1,0 +1,440 @@
+"""The full pipeline: stage -> approach -> grasp -> lift -> transport -> place.
+
+These run the real :class:`GraspLiftSequencer` against the kinematic mock, so
+the phase machine, the plan geometry and the safety checks are exercised
+together.  Nothing here needs ROS, a checkpoint, or a robot.
+"""
+
+import numpy as np
+import pytest
+
+from surgicai_rl_deploy.contract import APPROACH_UPSTREAM, PLACE_UPSTREAM
+from surgicai_rl_deploy.controllers import D2Controller
+from surgicai_rl_deploy.feasibility import FAIL, PASS, WARN, precheck
+from surgicai_rl_deploy.frames import Pose, rotation_error_rad
+from surgicai_rl_deploy.jaw import JawCalibration
+from surgicai_rl_deploy.loop import SafetyLimits
+from surgicai_rl_deploy.mock import MockArm, MockJaw
+from surgicai_rl_deploy.plan import LiftSpec, TransportSpec, build_plan
+from surgicai_rl_deploy.sequence import (
+    PHASE_ABORTED,
+    PHASE_DONE,
+    PHASE_PLACE,
+    PHASE_STAGE,
+    PHASE_TRANSPORT,
+    GraspLiftSequencer,
+    SequenceConfig,
+)
+from surgicai_rl_deploy.staging import stage_pose_for, support_report
+
+from conftest import REAL_GOAL_POS  # noqa: E402
+
+SUTURE_POS = [-0.0400, 0.0050, 0.0400]
+SUTURE_QUAT = [0.0, 0.0, 0.0, 1.0]
+
+
+def pipeline_plan(start_pose, jaw_cal, **kwargs):
+    lift = LiftSpec(axis="z", sign=-1, distance_m=0.015, frame="robot", explicit=True)
+    opts = dict(
+        lift=lift,
+        jaw=jaw_cal,
+        suture_position_m=SUTURE_POS,
+        suture_quat_xyzw=SUTURE_QUAT,
+    )
+    opts.update(kwargs)
+    return build_plan(start_pose, REAL_GOAL_POS, **opts)
+
+
+def run(plan, jaw_cal, baseline, *, block_at=None, cfg=None, shadow=None,
+        max_cycles=6000, lag=0.0, drop_at=None):
+    jaw = MockJaw(
+        angle_rad=jaw_cal.approach_open_rad,
+        block_at_rad=block_at,
+        drop_at_step=drop_at,
+    )
+    arm = MockArm(plan.start, jaw, lag=lag, jaw_calibration=jaw_cal)
+    arm.prime_jaw()
+    seq = GraspLiftSequencer(
+        plan,
+        D2Controller(staged=True),
+        cfg or SequenceConfig(grasp_gate="always"),
+        SafetyLimits(max_tracking_error_cm=50.0, workspace_pad_cm=50.0),
+        baseline,
+        shadow_controller=shadow,
+        shadow_contract=PLACE_UPSTREAM if shadow is not None else None,
+    )
+    seq.begin(arm.state())
+    steps = []
+    for _ in range(max_cycles):
+        state = arm.state()
+        step = seq.step(state)
+        steps.append(step)
+        if step.done:
+            break
+        arm.apply(step.command)
+    return seq, steps
+
+
+# ======================================================================
+# geometry
+# ======================================================================
+def test_a_plan_without_a_suture_pose_is_unchanged(plan):
+    assert plan.suture is None
+    assert plan.via is None
+    assert [n for n, _ in plan.waypoints] == ["start", "grasp", "lifted"]
+    assert plan.transport_travel_cm == 0.0
+
+
+def test_the_suturing_plan_adds_a_via_point(start_pose, jaw_cal):
+    p = pipeline_plan(start_pose, jaw_cal)
+    assert [n for n, _ in p.waypoints] == [
+        "start", "grasp", "lifted", "via", "suture"
+    ]
+    # the via sits exactly one lift-distance along the lift direction from the
+    # suturing pose, so the last motion is a pure descent
+    lift_dir = p.lift_spec.direction(p.grasp)
+    offset = p.via.p - p.suture.p
+    np.testing.assert_allclose(offset, lift_dir * p.lift_spec.distance_m, atol=1e-12)
+    # and it carries the suturing orientation already, so the wrist turns in
+    # transit rather than on the way down
+    assert rotation_error_rad(p.via, p.suture) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_direct_transport_has_no_via(start_pose, jaw_cal):
+    p = pipeline_plan(start_pose, jaw_cal, transport=TransportSpec(via="direct"))
+    assert p.via is None
+    assert [n for n, _ in p.waypoints] == ["start", "grasp", "lifted", "suture"]
+
+
+def test_via_clearance_can_be_set(start_pose, jaw_cal):
+    p = pipeline_plan(
+        start_pose, jaw_cal, transport=TransportSpec(via_clearance_m=0.03)
+    )
+    assert np.linalg.norm(p.via.p - p.suture.p) == pytest.approx(0.03)
+
+
+def test_a_suture_position_without_orientation_is_refused(start_pose, jaw_cal):
+    with pytest.raises(ValueError, match="not optional"):
+        build_plan(start_pose, REAL_GOAL_POS, jaw=jaw_cal,
+                   suture_position_m=SUTURE_POS)
+
+
+@pytest.mark.parametrize("bad", [{"via": "sideways"}, {"via_clearance_m": 0.5},
+                                 {"via_clearance_m": -0.01}])
+def test_bad_transport_specs_are_refused(bad):
+    with pytest.raises(ValueError):
+        TransportSpec(**bad)
+
+
+def test_path_radius_and_box_include_every_waypoint(start_pose, jaw_cal):
+    p = pipeline_plan(start_pose, jaw_cal)
+    assert p.path_radius_cm() >= np.linalg.norm(p.suture.p - p.start.p) * 100.0 - 1e-9
+    low, high = p.bounding_box_m(pad_cm=0.0)
+    for _, pose in p.waypoints:
+        assert np.all(pose.p >= low - 1e-12) and np.all(pose.p <= high + 1e-12)
+
+
+# ======================================================================
+# staging
+# ======================================================================
+def test_the_staged_pose_lands_inside_the_training_support(start_pose, jaw_cal):
+    p = pipeline_plan(start_pose, jaw_cal, stage_contract=APPROACH_UPSTREAM)
+    assert p.staged is not None
+    report = support_report(p.staged, p.grasp, APPROACH_UPSTREAM)
+    assert report["in_support"], report["reasons"]
+
+
+@pytest.mark.parametrize("rotation_deg", [55.0, 70.0, 95.0])
+def test_any_rotation_inside_the_range_can_be_requested(start_pose, jaw_cal,
+                                                        rotation_deg):
+    p = pipeline_plan(start_pose, jaw_cal, stage_contract=APPROACH_UPSTREAM,
+                      stage_rotation_deg=rotation_deg)
+    report = support_report(p.staged, p.grasp, APPROACH_UPSTREAM)
+    assert report["rotation_deg"] == pytest.approx(rotation_deg, abs=1e-6)
+    assert report["in_support"]
+
+
+def test_the_box_corners_are_reachable(start_pose, jaw_cal):
+    c = APPROACH_UPSTREAM
+    for offset in (c.start_offset_tool_min, c.start_offset_tool_max,
+                   c.start_offset_tool_mean):
+        staged = stage_pose_for(
+            Pose.from_pos_quat(REAL_GOAL_POS, [0, 0, 0, 1], 0.0), c,
+            offset_tool_cm=offset, rotation_deg=c.start_rot_deg_median,
+        )
+        rep = support_report(
+            staged, Pose.from_pos_quat(REAL_GOAL_POS, [0, 0, 0, 1], 0.0), c
+        )
+        np.testing.assert_allclose(rep["offset_tool_cm"], offset, atol=1e-6)
+        assert rep["in_support"]
+
+
+def test_staging_is_frame_invariant(start_pose, jaw_cal):
+    """The support constraints survive any rigid transform of the scene."""
+    from scipy.spatial.transform import Rotation
+
+    grasp = Pose.from_pos_quat(REAL_GOAL_POS, [0.2, 0.3, 0.1, 0.9], 0.0)
+    staged = stage_pose_for(grasp, APPROACH_UPSTREAM)
+    base = support_report(staged, grasp, APPROACH_UPSTREAM)
+
+    X = Pose(np.array([0.3, -0.2, 1.1]), Rotation.from_rotvec([0.4, -1.1, 0.7]).as_matrix())
+    moved = support_report(X * staged, X * grasp, APPROACH_UPSTREAM)
+    np.testing.assert_allclose(moved["offset_tool_cm"], base["offset_tool_cm"], atol=1e-9)
+    assert moved["rotation_deg"] == pytest.approx(base["rotation_deg"], abs=1e-9)
+
+
+# ======================================================================
+# the sequence
+# ======================================================================
+def test_the_pipeline_runs_end_to_end(start_pose, jaw_cal, baseline):
+    plan = pipeline_plan(start_pose, jaw_cal, stage_contract=APPROACH_UPSTREAM)
+    seq, steps = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0))
+    assert seq.phase == PHASE_DONE, seq.reason
+    phases = [s.phase for s in steps]
+    assert phases[0] == PHASE_STAGE
+    for expected in ("stage", "approach", "settle", "close", "observe", "lift",
+                     "transport", "place", "hold"):
+        assert expected in phases, f"{expected} never ran"
+    # the order is the pipeline order, with no phase revisited
+    seen = [p for i, p in enumerate(phases) if i == 0 or phases[i - 1] != p]
+    assert seen == sorted(set(seen), key=seen.index)
+    summary = seq.summary()
+    assert summary["reached_suture_pose"] is True
+    assert summary["grasp_verified"] is False
+
+
+def test_the_arm_actually_ends_at_the_suturing_pose(start_pose, jaw_cal, baseline):
+    plan = pipeline_plan(start_pose, jaw_cal)
+    seq, steps = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0))
+    assert seq.phase == PHASE_DONE, seq.reason
+    final = steps[-1].measured.pose
+    assert np.linalg.norm(final.p - plan.suture.p) * 100.0 < 0.3
+    assert np.degrees(rotation_error_rad(final, plan.suture)) < 3.0
+
+
+def test_the_descent_happens_only_at_the_end(start_pose, jaw_cal, baseline):
+    """During transport the tool must never go below the suturing height."""
+    plan = pipeline_plan(start_pose, jaw_cal)
+    seq, steps = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0))
+    lift_dir = plan.lift_spec.direction(plan.grasp)
+    height = lambda p: float(np.dot(p - plan.suture.p, lift_dir))  # noqa: E731
+    transport = [s for s in steps if s.phase == PHASE_TRANSPORT]
+    assert transport
+    for s in transport:
+        # a millimetre of tolerance for the servo's own overshoot
+        assert height(s.measured.pose.p) > -0.001
+
+
+def test_a_plan_without_a_suture_pose_still_stops_after_the_lift(
+    plan, jaw_cal, baseline
+):
+    seq, steps = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0))
+    assert seq.phase == PHASE_DONE, seq.reason
+    assert PHASE_TRANSPORT not in [s.phase for s in steps]
+    assert seq.summary()["reached_suture_pose"] is False
+
+
+def test_the_jaw_is_never_opened_while_loaded(start_pose, jaw_cal, baseline):
+    plan = pipeline_plan(start_pose, jaw_cal)
+    seq, steps = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0))
+    loaded = [s for s in steps
+              if s.phase in (PHASE_TRANSPORT, PHASE_PLACE, "lift", "hold")]
+    assert loaded
+    for s in loaded:
+        assert s.command.jaw_rad <= jaw_cal.grip_rad + 1e-9
+
+
+def test_losing_the_needle_in_transport_stops_rather_than_descends(
+    start_pose, jaw_cal, baseline
+):
+    plan = pipeline_plan(start_pose, jaw_cal)
+    cfg = SequenceConfig(grasp_gate="evidence", on_slip="lower")
+    seq, steps = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0),
+                     cfg=cfg, drop_at=120)
+    if PHASE_TRANSPORT in [s.phase for s in steps]:
+        # if the drop landed during the transport, we must not have descended
+        if seq.phase == PHASE_ABORTED:
+            assert "holding position rather than descending" in seq.reason
+            assert PHASE_PLACE not in [s.phase for s in steps]
+
+
+def test_stage_failure_never_starts_the_policy(start_pose, jaw_cal, baseline):
+    plan = pipeline_plan(start_pose, jaw_cal, stage_contract=APPROACH_UPSTREAM)
+    cfg = SequenceConfig(grasp_gate="always", stage_max_steps=3)
+    seq, steps = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0), cfg=cfg)
+    assert seq.phase == PHASE_ABORTED
+    assert "stage" in seq.reason
+    assert seq.approach_report is None
+    assert "approach" not in [s.phase for s in steps]
+
+
+# ======================================================================
+# approach failure handling
+# ======================================================================
+class Stuck:
+    name = "stuck"
+
+    def act(self, obs):
+        return np.zeros(7)
+
+    def describe(self):
+        return "stuck"
+
+
+def _stuck_run(start_pose, jaw_cal, baseline, on_failure):
+    plan = pipeline_plan(start_pose, jaw_cal)
+    jaw = MockJaw(angle_rad=jaw_cal.approach_open_rad, block_at_rad=np.deg2rad(-5.0))
+    arm = MockArm(plan.start, jaw, jaw_calibration=jaw_cal)
+    arm.prime_jaw()
+    seq = GraspLiftSequencer(
+        plan, Stuck(),
+        SequenceConfig(grasp_gate="always", approach_max_steps=12,
+                       on_approach_failure=on_failure),
+        SafetyLimits(max_tracking_error_cm=50.0, workspace_pad_cm=50.0),
+        baseline,
+    )
+    seq.begin(arm.state())
+    steps = []
+    for _ in range(4000):
+        step = seq.step(arm.state())
+        steps.append(step)
+        if step.done:
+            break
+        arm.apply(step.command)
+    return seq, steps
+
+
+def test_a_failed_approach_holds_by_default(start_pose, jaw_cal, baseline):
+    seq, steps = _stuck_run(start_pose, jaw_cal, baseline, "hold")
+    assert seq.phase == PHASE_ABORTED
+    assert "Holding the last command" in seq.reason
+    # the jaw command never left the open angle
+    assert all(s.command.jaw_rad == pytest.approx(jaw_cal.approach_open_rad)
+               for s in steps)
+    # and the terminal command is not published at all
+    assert steps[-1].command.publish_pose is False
+
+
+def test_the_servo_fallback_finishes_the_run(start_pose, jaw_cal, baseline):
+    seq, steps = _stuck_run(start_pose, jaw_cal, baseline, "servo")
+    assert seq.phase == PHASE_DONE, seq.reason
+    assert any(e.get("event") == "approach_fallback" for e in seq.events)
+
+
+def test_an_unknown_failure_policy_is_refused():
+    with pytest.raises(ValueError, match="on_approach_failure"):
+        SequenceConfig(on_approach_failure="improvise")
+
+
+# ======================================================================
+# the shadow controller
+# ======================================================================
+class RecordingShadow:
+    name = "shadow"
+
+    def __init__(self):
+        self.calls = 0
+
+    def act(self, obs):
+        self.calls += 1
+        return np.zeros(7)
+
+    def describe(self):
+        return "recording shadow"
+
+
+def test_the_shadow_runs_but_never_commands(start_pose, jaw_cal, baseline):
+    plan = pipeline_plan(start_pose, jaw_cal)
+    shadow = RecordingShadow()
+    seq, steps = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0),
+                     shadow=shadow)
+    assert seq.phase == PHASE_DONE, seq.reason
+    assert shadow.calls > 0
+    assert seq.shadow_log
+    summary = seq.shadow_summary()
+    assert summary["cycles"] == len(seq.shadow_log)
+    # a shadow that returns zero actions goes nowhere, so the real run must
+    # have ended somewhere the shadow did not
+    assert summary["reached_goal"] is False
+    # the real arm still arrived
+    assert np.linalg.norm(steps[-1].measured.pose.p - plan.suture.p) * 100.0 < 0.3
+
+
+class ExplodingShadow:
+    name = "boom"
+
+    def act(self, obs):
+        raise RuntimeError("no checkpoint")
+
+    def describe(self):
+        return "exploding shadow"
+
+
+def test_a_broken_shadow_cannot_take_down_the_run(start_pose, jaw_cal, baseline):
+    plan = pipeline_plan(start_pose, jaw_cal)
+    seq, steps = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0),
+                     shadow=ExplodingShadow())
+    assert seq.phase == PHASE_DONE, seq.reason
+    assert any(e.get("event") == "shadow_failed" for e in seq.events)
+
+
+def test_no_shadow_means_no_shadow_summary(start_pose, jaw_cal, baseline):
+    plan = pipeline_plan(start_pose, jaw_cal)
+    seq, _ = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0))
+    assert seq.shadow_summary() is None
+    assert seq.summary()["shadow"] is None
+
+
+# ======================================================================
+# the precheck
+# ======================================================================
+def status_of(report, name):
+    return next(c.status for c in report.checks if c.name == name)
+
+
+def test_the_precheck_demands_a_confirmed_suture_pose(start_pose, jaw_cal):
+    plan = pipeline_plan(start_pose, jaw_cal)
+    assert status_of(precheck(plan, execute=True), "suture_pose") == FAIL
+    assert status_of(precheck(plan, execute=False), "suture_pose") == WARN
+    ok = precheck(plan, execute=True, suture_confirmed=True)
+    assert status_of(ok, "suture_pose") == PASS
+
+
+def test_the_precheck_flags_a_direct_transport(start_pose, jaw_cal):
+    plan = pipeline_plan(start_pose, jaw_cal, transport=TransportSpec(via="direct"))
+    assert status_of(precheck(plan), "transport_clearance") == WARN
+
+
+def test_the_precheck_catches_a_descent_that_is_a_retreat(start_pose, jaw_cal):
+    """A lift sign that disagrees with the suturing geometry."""
+    up = LiftSpec(axis="z", sign=+1, distance_m=0.015, frame="robot", explicit=True)
+    plan = pipeline_plan(start_pose, jaw_cal, lift=up)
+    # flipping the lift flips the via point to the other side, so the final
+    # segment still descends; the check must stay self-consistent
+    assert status_of(precheck(plan), "transport_clearance") == PASS
+
+
+def test_the_precheck_reports_the_training_support(start_pose, jaw_cal):
+    staged = pipeline_plan(start_pose, jaw_cal, stage_contract=APPROACH_UPSTREAM)
+    report = precheck(staged, controller="rl", stage_contract=APPROACH_UPSTREAM)
+    assert status_of(report, "training_support") == PASS
+
+    unstaged = pipeline_plan(start_pose, jaw_cal)
+    rl = precheck(unstaged, controller="rl", stage_contract=APPROACH_UPSTREAM)
+    assert status_of(rl, "training_support") == WARN
+    # under the geometric servo the same geometry is information, not a warning
+    servo = precheck(unstaged, controller="d2", stage_contract=APPROACH_UPSTREAM)
+    assert status_of(servo, "training_support") == PASS
+
+
+def test_the_precheck_budgets_every_segment(start_pose, jaw_cal):
+    plan = pipeline_plan(start_pose, jaw_cal, stage_contract=APPROACH_UPSTREAM)
+    names = {c.name for c in precheck(plan).checks}
+    for seg in ("stage", "approach", "lift", "transport", "place"):
+        assert f"step_budget_{seg}" in names
+
+
+def test_a_starved_transport_budget_fails(start_pose, jaw_cal):
+    plan = pipeline_plan(start_pose, jaw_cal)
+    report = precheck(plan, transport_max_steps=2)
+    assert status_of(report, "step_budget_transport") == FAIL

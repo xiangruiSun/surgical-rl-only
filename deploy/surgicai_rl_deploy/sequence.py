@@ -1,11 +1,22 @@
-"""The approach -> close -> observe -> lift state machine.
+"""The stage -> approach -> grasp -> lift -> transport -> place state machine.
 
 No ROS, no AMBF, no torch.  The ROS node, the offline replay tool and the
 simulation env all drive this same object, so what is validated offline is
 literally the code that runs on the robot.
 
+The phases are data-driven off the plan: a plan with no ``staged`` pose starts
+at ``approach``, and one with no ``suture`` pose ends after the lift.  The same
+class therefore runs a bare grasp-and-lift and the full suturing pipeline, and
+Insert or Pullout drop in as two more segments when someone decides that is a
+safe thing to do.
+
 Phases
 ------
+``stage``
+    Servo from wherever the arm is to the pose that puts the approach policy
+    inside its own training support (see :mod:`.staging`).  Deterministic, no
+    policy involved -- the policy cannot be trusted to get itself in
+    distribution, since being out of it is the problem.
 ``approach``
     Drive to the grasp pose with the jaw held open.  This is the existing,
     contract-verified :class:`~.loop.ApproachLoop`, unchanged, with whichever
@@ -24,8 +35,18 @@ Phases
 ``lift``
     Translate to the lift pose (1.5 cm by default), orientation frozen at the
     grasp orientation, jaw held at the squeeze angle.
+``transport``
+    Carry the needle from the lift pose to a point directly above the suturing
+    pose, turning the wrist on the way.  The jaw is watched throughout and the
+    arm never descends here.  If a second controller was supplied it runs
+    alongside on the same geometry, logged and never published.
+``place``
+    Descend onto the suturing pose with the orientation already correct.  The
+    tightest tolerance in the run, and the only motion that approaches tissue
+    with a needle in the jaws.
 ``hold``
-    Keep station at the lift pose for a few cycles and take a final reading.
+    Keep station wherever the sequence ended for a few cycles and take a final
+    reading.
 ``done`` / ``aborted``
     Terminal.  On abort the last command is held and **the jaw is not
     opened** -- opening a gripper that may be holding a needle several
@@ -51,17 +72,24 @@ from .jaw import (
 from .loop import ApproachLoop, LoopConfig, SafetyLimits
 from .plan import GraspLiftPlan
 
+PHASE_STAGE = "stage"
 PHASE_APPROACH = "approach"
 PHASE_SETTLE = "settle"
 PHASE_CLOSE = "close"
 PHASE_OBSERVE = "observe"
 PHASE_WAIT_OPERATOR = "wait_operator"
 PHASE_LIFT = "lift"
+PHASE_TRANSPORT = "transport"
+PHASE_PLACE = "place"
 PHASE_HOLD = "hold"
 PHASE_DONE = "done"
 PHASE_ABORTED = "aborted"
 
 TERMINAL_PHASES = (PHASE_DONE, PHASE_ABORTED)
+
+#: every phase in which the needle is (believed to be) in the jaws, so the jaw
+#: is watched and a slip matters
+LOADED_PHASES = (PHASE_LIFT, PHASE_TRANSPORT, PHASE_PLACE, PHASE_HOLD)
 
 #: the jaw command moves this far per control cycle, mirroring the training
 #: contract's 0.05 normalised jaw step (0.05 * 60 deg = 3 deg)
@@ -130,11 +158,37 @@ class SequenceStep:
 
 @dataclass
 class SequenceConfig:
+    # -- stage -------------------------------------------------------------
+    #: servo the arm to plan.staged before the policy takes over, so the
+    #: approach leg begins inside its own training support
+    stage_max_steps: int = 400
+    stage_success_trans_cm: float = 0.2
+    stage_success_rot_deg: float = 2.0
+
     # -- approach ----------------------------------------------------------
     frame_mode: str = "rebase"
     approach_max_steps: int = 200
     approach_success_trans_cm: float = 1.0
     approach_success_rot_deg: float = 10.0
+    #: what to do when the approach policy does not converge.
+    #:   'hold'  -- stop at the last command, jaw untouched, hand back to a human
+    #:   'servo' -- finish the approach geometrically and carry on
+    #: 'hold' is the default because an approach that failed is, by definition,
+    #: an arm that did something nobody predicted.
+    on_approach_failure: str = "hold"
+    #: the checkpoint contract driving the approach leg, if any.  Supplies the
+    #: action scale, the episode budget and the jaw envelope the policy was
+    #: trained with, all of which differ per checkpoint.
+    approach_contract: object = None
+
+    # -- transport and place ------------------------------------------------
+    transport_max_steps: int = 600
+    transport_success_trans_cm: float = 0.3
+    transport_success_rot_deg: float = 5.0
+    place_max_steps: int = 400
+    #: the descent onto the entry point is the tightest motion in the run
+    place_success_trans_cm: float = 0.2
+    place_success_rot_deg: float = 3.0
 
     # -- settle ------------------------------------------------------------
     #: half-window length: the mean pose over the last ``settle_steps`` cycles
@@ -191,6 +245,10 @@ class SequenceConfig:
             raise ValueError(f"unknown grasp gate {self.grasp_gate!r}")
         if self.on_slip not in ("abort", "continue", "lower"):
             raise ValueError(f"unknown on_slip policy {self.on_slip!r}")
+        if self.on_approach_failure not in ("hold", "servo"):
+            raise ValueError(
+                f"unknown on_approach_failure {self.on_approach_failure!r}"
+            )
         for name in ("settle_steps", "close_dwell_steps", "observe_steps",
                      "evidence_streak", "slip_streak"):
             if int(getattr(self, name)) < 1:
@@ -211,9 +269,19 @@ class GraspLiftSequencer:
         jaw_baseline: Optional[JawBaseline] = None,
         *,
         confirm_callback: Optional[Callable[[], Optional[bool]]] = None,
+        shadow_controller=None,
+        shadow_contract=None,
     ):
         self.plan = plan
         self.cfg = config or SequenceConfig()
+        #: an optional second controller run alongside the transport and place
+        #: legs on identical geometry.  Its actions are recorded and never
+        #: published, so "would the Place policy have worked here" can be
+        #: answered from real runs without ever letting it hold the needle.
+        self.shadow_controller = shadow_controller
+        self.shadow_contract = shadow_contract
+        self._shadow_loop: Optional[ApproachLoop] = None
+        self.shadow_log: list = []
         self.limits = limits or SafetyLimits()
         self.baseline = jaw_baseline
         self.confirm_callback = confirm_callback
@@ -230,6 +298,8 @@ class GraspLiftSequencer:
         self.index = 0
         self.phase_step = 0
         self.reason = "running"
+        self._begun = False
+        self.approach_report: Optional[dict] = None
 
         self._approach_loop: Optional[ApproachLoop] = None
         self._segment_loop: Optional[ApproachLoop] = None
@@ -252,7 +322,8 @@ class GraspLiftSequencer:
     # ------------------------------------------------------------------
     # setup
     # ------------------------------------------------------------------
-    def begin(self, start: ArmState) -> dict:
+    def _approach_config(self) -> LoopConfig:
+        contract = self.cfg.approach_contract
         cfg = LoopConfig(
             frame_mode=self.cfg.frame_mode,
             goal_orientation="explicit",
@@ -267,12 +338,66 @@ class GraspLiftSequencer:
             **({} if self.cfg.step_size is None
                else {"step_size": np.asarray(self.cfg.step_size, dtype=np.float64)}),
         )
-        self._approach_loop = ApproachLoop(self.approach_controller, cfg, self.limits)
-        report = self._approach_loop.begin(start.pose, self.plan.grasp.p)
+        if contract is not None:
+            # The policy's own action scale and jaw envelope, unless the
+            # operator overrode the scale on the command line.
+            if self.cfg.step_size is None:
+                cfg.step_size = np.asarray(contract.step_size, dtype=np.float64)
+            # Training closed the jaw during the approach and the jaw is three
+            # of the twenty-one observation dimensions; the gripper stays open
+            # regardless, because use_policy_jaw is False.
+            cfg.policy_jaw_start = float(contract.demo_start_jaw)
+            cfg.goal_jaw = str(float(contract.demo_goal_jaw))
+        return cfg
+
+    def _begin_approach(self, measured: Pose) -> dict:
+        self._approach_loop = ApproachLoop(
+            self.approach_controller, self._approach_config(), self.limits,
+            contract=self.cfg.approach_contract,
+        )
+        report = self._approach_loop.begin(measured, self.plan.grasp.p)
+        self.approach_report = report
         self._segment_goal = self.plan.grasp
+        return report
+
+    def begin(self, start: ArmState) -> dict:
         self.jaw_command_rad = float(self.jaw.approach_open_rad)
         self._prev_measured = start.pose
-        return report
+
+        self._begun = True
+        if self.plan.staged is not None:
+            # Servo to the staging pose first; the policy is handed an arm that
+            # is already inside its training support.  The approach loop is not
+            # created until that motion has finished, because it must be seeded
+            # from where the arm actually ends up, not from where it was asked
+            # to go.
+            self.phase = PHASE_STAGE
+            self._start_segment(
+                start.pose, self.plan.staged,
+                max_steps=self.cfg.stage_max_steps,
+                success_trans_cm=self.cfg.stage_success_trans_cm,
+                success_rot_deg=self.cfg.stage_success_rot_deg,
+            )
+            from .staging import support_report
+
+            report = {
+                "phase": PHASE_STAGE,
+                "staging": (
+                    None if self.cfg.approach_contract is None
+                    else support_report(
+                        self.plan.staged, self.plan.grasp, self.cfg.approach_contract
+                    )
+                ),
+                "stage_travel_cm": float(
+                    np.linalg.norm(self.plan.staged.p - start.pose.p) * 100.0
+                ),
+                "note": "approach distribution is reported once the arm is staged",
+            }
+            self.approach_report = None
+            return report
+
+        self.phase = PHASE_APPROACH
+        return self._begin_approach(start.pose)
 
     # ------------------------------------------------------------------
     # helpers
@@ -311,6 +436,130 @@ class GraspLiftSequencer:
         self._segment_loop = loop
         self._segment_goal = goal
         return loop
+
+    def _begin_transport(self, measured: Pose, events: list):
+        """Leave the lift pose for the suturing point, with the needle held."""
+        target = self.plan.via or self.plan.suture
+        self._start_segment(
+            measured, target,
+            max_steps=self.cfg.transport_max_steps,
+            success_trans_cm=self.cfg.transport_success_trans_cm,
+            success_rot_deg=self.cfg.transport_success_rot_deg,
+        )
+        self._start_shadow(measured, events)
+        events.append({
+            "i": self.index, "event": "transport_begin",
+            "target": "via" if self.plan.via is not None else "suture",
+            "travel_cm": float(np.linalg.norm(target.p - measured.p) * 100.0),
+            "rotation_deg": float(
+                np.degrees(rotation_error_rad(Pose(measured.p, measured.R, 0.0), target))
+            ),
+        })
+        self._enter(PHASE_TRANSPORT, "carrying the needle to the suturing point")
+
+    # ------------------------------------------------------------------
+    # the shadow policy: measured, never in command
+    # ------------------------------------------------------------------
+    def _start_shadow(self, measured: Pose, events: list):
+        if self.shadow_controller is None or self.plan.suture is None:
+            return
+        contract = self.shadow_contract
+        cfg = LoopConfig(
+            frame_mode=self.cfg.frame_mode,
+            goal_orientation="explicit",
+            goal_quat_xyzw=tuple(self.plan.suture.quat_xyzw()),
+            goal_jaw=str(self.plan.suture.jaw),
+            use_policy_jaw=False,
+            max_steps=self.cfg.transport_max_steps + self.cfg.place_max_steps,
+            success_trans_cm=(
+                0.5 if contract is None else contract.success_trans_cm
+            ),
+            success_rot_rad=(
+                float(np.deg2rad(30.0)) if contract is None
+                else contract.success_rot_rad
+            ),
+            **({} if contract is None
+               else {"step_size": np.asarray(contract.step_size, dtype=np.float64),
+                     "policy_jaw_start": float(contract.demo_start_jaw)}),
+        )
+        try:
+            loop = ApproachLoop(self.shadow_controller, cfg, self.limits,
+                                contract=contract)
+            report = loop.begin(measured, self.plan.suture.p)
+        except Exception as exc:  # a shadow must never take down the real run
+            events.append({"i": self.index, "event": "shadow_unavailable",
+                           "error": f"{type(exc).__name__}: {exc}"})
+            self._shadow_loop = None
+            return
+        self._shadow_loop = loop
+        events.append({"i": self.index, "event": "shadow_begin",
+                       "controller": self.shadow_controller.describe(),
+                       "in_distribution": report.get("in_distribution"),
+                       "out_of_distribution": report.get("out_of_distribution")})
+
+    def _shadow_step(self, measured: ArmState, events: list):
+        """Run the shadow controller on this cycle and record what it wanted.
+
+        It is fed the *measured* pose every cycle, not its own integrator,
+        because the question being asked is counterfactual -- "from where the
+        arm actually is, what would this policy have done next" -- and a free
+        integrator would answer a question about a trajectory that never
+        happened.  The answer is logged and discarded.
+        """
+        if self._shadow_loop is None:
+            return
+        try:
+            result = self._shadow_loop.step(measured.pose)
+        except Exception as exc:
+            events.append({"i": self.index, "event": "shadow_failed",
+                           "error": f"{type(exc).__name__}: {exc}"})
+            self._shadow_loop = None
+            return
+        real = self._last_command
+        divergence_mm = (
+            None if real is None
+            else float(np.linalg.norm(result.command.p - real.pose.p) * 1000.0)
+        )
+        self.shadow_log.append({
+            "i": self.index,
+            "phase": self.phase,
+            "action": np.asarray(result.action, dtype=float).round(4).tolist(),
+            "proposed_cm": (result.command.p * 100.0).tolist(),
+            "trans_err_cm": result.trans_err_cm,
+            "rot_err_deg": result.rot_err_deg,
+            "divergence_from_commanded_mm": divergence_mm,
+            "would_have_finished": result.reason,
+        })
+        if result.done:
+            events.append({"i": self.index, "event": "shadow_finished",
+                           "reason": result.reason,
+                           "trans_err_cm": result.trans_err_cm,
+                           "rot_err_deg": result.rot_err_deg})
+            self._shadow_loop = None
+
+    def shadow_summary(self) -> Optional[dict]:
+        if not self.shadow_log:
+            return None
+        div = [r["divergence_from_commanded_mm"] for r in self.shadow_log
+               if r["divergence_from_commanded_mm"] is not None]
+        closest = min(r["trans_err_cm"] for r in self.shadow_log)
+        return {
+            "cycles": len(self.shadow_log),
+            "closest_trans_cm": closest,
+            "final_trans_cm": self.shadow_log[-1]["trans_err_cm"],
+            "final_rot_deg": self.shadow_log[-1]["rot_err_deg"],
+            "median_divergence_mm": float(np.median(div)) if div else None,
+            "max_divergence_mm": float(np.max(div)) if div else None,
+            "reached_goal": any(
+                r["would_have_finished"] == "success" for r in self.shadow_log
+            ),
+            "note": (
+                "This controller never held the needle. The numbers say what it "
+                "would have commanded from the poses the arm actually visited, "
+                "which is not the same as what would have happened had it been "
+                "driving -- it would have visited different poses."
+            ),
+        }
 
     def _jaw_evidence(self, measured: ArmState) -> JawEvidence:
         return evaluate_jaw_evidence(
@@ -372,7 +621,7 @@ class GraspLiftSequencer:
     # the cycle
     # ------------------------------------------------------------------
     def step(self, measured: ArmState) -> SequenceStep:
-        if self._approach_loop is None:
+        if not self._begun:
             raise RuntimeError("call begin() before step()")
 
         self.index += 1
@@ -386,12 +635,35 @@ class GraspLiftSequencer:
         # The jaw is watched in every phase from the close onwards, so a needle
         # lost during the lift shows up in the same record as the grasp.
         if self.phase in (PHASE_CLOSE, PHASE_OBSERVE, PHASE_WAIT_OPERATOR,
-                          PHASE_LIFT, PHASE_HOLD):
+                          *LOADED_PHASES):
             evidence = self._jaw_evidence(measured)
             self.window.update(evidence)
 
         # ------------------------------------------------------------------
-        if self.phase == PHASE_APPROACH:
+        if self.phase == PHASE_STAGE:
+            result = self._hold_command(measured)
+            action, clamps = result.action, result.clamps
+            command = Command(result.command, self.jaw.approach_open_rad)
+            trans_err, rot_err = result.trans_err_cm, result.rot_err_deg
+
+            if result.reason == "success":
+                report = self._begin_approach(measured.pose)
+                events.append({
+                    "i": self.index, "event": "staged",
+                    "trans_err_cm": trans_err, "rot_err_deg": rot_err,
+                    "in_distribution": report.get("in_distribution"),
+                    "out_of_distribution": report.get("out_of_distribution"),
+                })
+                self._enter(PHASE_APPROACH, "arm staged inside the training support")
+            elif result.done:
+                self._finish(
+                    PHASE_ABORTED,
+                    f"stage {result.reason}: the arm never reached the staging "
+                    "pose, so the approach policy was never started",
+                )
+
+        # ------------------------------------------------------------------
+        elif self.phase == PHASE_APPROACH:
             result = self._approach_loop.step(measured.pose)
             action, clamps = result.action, result.clamps
             command = Command(result.command, self.jaw.approach_open_rad)
@@ -408,7 +680,29 @@ class GraspLiftSequencer:
                 )
                 self._enter(PHASE_SETTLE, "approach reached the grasp pose")
             elif result.done:
-                self._finish(PHASE_ABORTED, f"approach {result.reason}")
+                if self.cfg.on_approach_failure == "servo":
+                    events.append({
+                        "i": self.index, "event": "approach_fallback",
+                        "approach_reason": result.reason,
+                        "note": "the policy did not converge; the geometric "
+                                "servo is finishing the approach",
+                    })
+                    self._start_segment(
+                        measured.pose,
+                        Pose(self.plan.grasp.p, self.plan.grasp.R, self.plan.grasp.jaw),
+                        max_steps=self.cfg.approach_max_steps,
+                        success_trans_cm=self.cfg.approach_success_trans_cm,
+                        success_rot_deg=self.cfg.approach_success_rot_deg,
+                    )
+                    self._approach_loop = self._segment_loop
+                    self.approach_controller = self.hold_controller
+                else:
+                    self._finish(
+                        PHASE_ABORTED,
+                        f"approach {result.reason}. Holding the last command with "
+                        "the jaw untouched; nothing else will move until a human "
+                        "decides what to do.",
+                    )
 
         # ------------------------------------------------------------------
         elif self.phase == PHASE_SETTLE:
@@ -562,9 +856,70 @@ class GraspLiftSequencer:
                          np.linalg.norm(measured.pose.p - self.plan.grasp.p) * 100.0
                      )}
                 )
-                self._enter(PHASE_HOLD, "lift reached")
+                if self.plan.suture is None:
+                    self._enter(PHASE_HOLD, "lift reached")
+                else:
+                    self._begin_transport(measured.pose, events)
             elif result.done:
                 self._finish(PHASE_ABORTED, f"lift {result.reason}")
+
+        # ------------------------------------------------------------------
+        elif self.phase == PHASE_TRANSPORT:
+            result = self._hold_command(measured)
+            action, clamps = result.action, result.clamps
+            command = Command(result.command, self.jaw_command_rad)
+            trans_err, rot_err = result.trans_err_cm, result.rot_err_deg
+            self._shadow_step(measured, events)
+
+            slip = self._check_slip(evidence, events)
+            if slip in ("abort", "lower"):
+                # Nothing is lowered while loaded and in transit: the needle is
+                # somewhere between the pad and the entry point, and driving
+                # down through an unknown gap is worse than stopping.
+                self._finish(
+                    PHASE_ABORTED,
+                    "jaw evidence disappeared during the transport; holding "
+                    "position rather than descending",
+                )
+            elif result.reason == "success":
+                events.append({"i": self.index, "event": "transport_reached",
+                               "trans_err_cm": trans_err, "rot_err_deg": rot_err})
+                self._start_segment(
+                    measured.pose, self.plan.suture,
+                    max_steps=self.cfg.place_max_steps,
+                    success_trans_cm=self.cfg.place_success_trans_cm,
+                    success_rot_deg=self.cfg.place_success_rot_deg,
+                )
+                self._enter(PHASE_PLACE, "above the suturing point, descending")
+            elif result.done:
+                self._finish(PHASE_ABORTED, f"transport {result.reason}")
+
+        # ------------------------------------------------------------------
+        elif self.phase == PHASE_PLACE:
+            result = self._hold_command(measured)
+            action, clamps = result.action, result.clamps
+            command = Command(result.command, self.jaw_command_rad)
+            trans_err, rot_err = result.trans_err_cm, result.rot_err_deg
+            self._shadow_step(measured, events)
+
+            slip = self._check_slip(evidence, events)
+            if slip in ("abort", "lower"):
+                self._finish(
+                    PHASE_ABORTED,
+                    "jaw evidence disappeared during the descent onto the "
+                    "suturing point",
+                )
+            elif result.reason == "success":
+                events.append({
+                    "i": self.index, "event": "suture_pose_reached",
+                    "trans_err_cm": trans_err, "rot_err_deg": rot_err,
+                    "note": "the tool is at the commanded pose. Where the NEEDLE "
+                            "is depends on how it sits in the jaws, which this "
+                            "deployment never measured.",
+                })
+                self._enter(PHASE_HOLD, "suturing pose reached")
+            elif result.done:
+                self._finish(PHASE_ABORTED, f"place {result.reason}")
 
         # ------------------------------------------------------------------
         elif self.phase == PHASE_HOLD:
@@ -585,9 +940,27 @@ class GraspLiftSequencer:
                 np.degrees(rotation_error_rad(measured.pose, self._segment_goal or self.plan.grasp))
             )
 
-        self._last_command = command
-        self._prev_measured = measured.pose
         done = self.phase in TERMINAL_PHASES
+        if done and entry_phase not in TERMINAL_PHASES:
+            # The cycle that ends the run must not issue a fresh command. On an
+            # abort the arm holds whatever it was last told, which is the pose
+            # it is already tracking; on success there is nothing left to say.
+            held = self._last_command or Command(measured.pose, self.jaw_command_rad)
+            command = Command(held.pose, held.jaw_rad, False, False)
+        else:
+            self._last_command = command
+
+        self._prev_measured = measured.pose
+
+        merged = events + [
+            e for e in self.events if e.get("i") == self.index and e not in events
+        ]
+        # Phase-local events are worth keeping on the sequencer too: summary()
+        # is what an operator reads after the fact, and "the policy failed and
+        # the servo finished the approach" is not a detail.
+        for entry in events:
+            if entry not in self.events:
+                self.events.append(entry)
 
         return SequenceStep(
             index=self.index,
@@ -600,8 +973,7 @@ class GraspLiftSequencer:
             action=np.asarray(action, dtype=np.float64),
             jaw_evidence=evidence,
             clamps=clamps,
-            events=events + [e for e in self.events if e.get("i") == self.index
-                             and e not in events],
+            events=merged,
             done=done,
             reason=self.reason if done else "running",
         )
@@ -685,6 +1057,11 @@ class GraspLiftSequencer:
             "phase": self.phase,
             "reason": self.reason,
             "steps": self.index,
+            "reached_suture_pose": bool(
+                self.plan.suture is not None
+                and any(e.get("event") == "suture_pose_reached" for e in self.events)
+            ),
+            "shadow": self.shadow_summary(),
             "grasp_gate": self.cfg.grasp_gate,
             "gate_decision": self.gate_decision,
             "jaw_evidence": self.window.summary(),

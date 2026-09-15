@@ -59,40 +59,14 @@ from surgicai_rl_deploy.contract import (
     SUPPORT_EPS_CM,
 )
 from surgicai_rl_deploy.frames import Pose, rotation_error_rad
+from surgicai_rl_deploy.staging import solve_start_pose as _solve_start_pose
+from surgicai_rl_deploy.staging import support_report as _support_report
 
 
-def solve_start_pose(grasp: Pose, offset_tool_cm, rotvec) -> Pose:
-    """The start pose whose tool offset and rotation are the ones given."""
-    rel = Rotation.from_rotvec(np.asarray(rotvec, dtype=np.float64)).as_matrix()
-    # R_grasp = R_start @ rel   ->   R_start = R_grasp @ rel^-1
-    R_start = grasp.R @ rel.T
-    p_start = grasp.p - R_start @ (np.asarray(offset_tool_cm, dtype=np.float64) / 100.0)
-    return Pose(p_start, R_start, grasp.jaw)
-
-
-def support_report(start: Pose, grasp: Pose) -> dict:
-    offset = start.R.T @ ((grasp.p - start.p) * 100.0)
-    rot_deg = float(np.degrees(rotation_error_rad(start, grasp)))
-    inside_box = bool(
-        np.all(offset >= R6_START_OFFSET_TOOL_MIN - SUPPORT_EPS_CM)
-        and np.all(offset <= R6_START_OFFSET_TOOL_MAX + SUPPORT_EPS_CM)
-    )
-    inside_rot = bool(R6_START_ROT_DEG_MIN <= rot_deg <= R6_START_ROT_DEG_MAX)
-    # distance to the nearest box face, per axis, in cm
-    margin = np.minimum(offset - R6_START_OFFSET_TOOL_MIN,
-                        R6_START_OFFSET_TOOL_MAX - offset)
-    return {
-        "offset_tool_cm": offset,
-        "rotation_deg": rot_deg,
-        "travel_cm": float(np.linalg.norm(grasp.p - start.p) * 100.0),
-        "inside_box": inside_box,
-        "inside_rotation": inside_rot,
-        "in_support": inside_box and inside_rot,
-        "box_margin_cm": margin,
-        "rotation_margin_deg": float(
-            min(rot_deg - R6_START_ROT_DEG_MIN, R6_START_ROT_DEG_MAX - rot_deg)
-        ),
-    }
+# The solver moved into the package so the node, the sweep and the pipeline
+# all use one implementation; these names stay for callers and tests.
+solve_start_pose = _solve_start_pose
+support_report = _support_report
 
 
 def main(argv=None) -> int:

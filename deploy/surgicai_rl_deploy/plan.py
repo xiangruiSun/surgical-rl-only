@@ -85,15 +85,113 @@ class LiftSpec:
         )
 
 
+@dataclass(frozen=True)
+class TransportSpec:
+    """How the loaded arm travels from the lift pose to the suturing pose.
+
+    ``lift_height`` (the default) inserts a via point directly "above" the
+    suturing pose -- displaced back along the lift direction by the lift
+    distance -- so the motion is: travel at height with the wrist turning, then
+    a pure descent onto the entry point with the orientation already correct.
+
+    The alternative, ``direct``, interpolates straight from the lift pose to
+    the suturing pose.  That path can dip below the tissue plane in the middle
+    while carrying a needle, which is why it is not the default.  SurgicAI's
+    own pipeline does the same thing in ``Place_env.mid_goal_evaluator``: a
+    waypoint 3.5 cm before the entry, raised.
+    """
+
+    via: str = "lift_height"
+    #: metres; None means "the same distance as the lift"
+    via_clearance_m: Optional[float] = None
+
+    def __post_init__(self):
+        if self.via not in ("lift_height", "direct"):
+            raise ValueError(f"transport via must be 'lift_height' or 'direct'; "
+                             f"got {self.via!r}")
+        if self.via_clearance_m is not None and not (
+            np.isfinite(self.via_clearance_m) and 0.0 < self.via_clearance_m <= 0.10
+        ):
+            raise ValueError("transport clearance must be a positive number of "
+                             "metres no greater than 10 cm")
+
+    def via_pose(self, suture: Pose, lift: LiftSpec, grasp: Pose) -> Optional[Pose]:
+        if self.via == "direct":
+            return None
+        clearance = (
+            lift.distance_m if self.via_clearance_m is None else self.via_clearance_m
+        )
+        return Pose(
+            suture.p + lift.direction(grasp) * float(clearance),
+            suture.R.copy(),
+            suture.jaw,
+        )
+
+    def describe(self) -> str:
+        if self.via == "direct":
+            return "straight from the lift pose to the suturing pose"
+        clearance = self.via_clearance_m
+        where = "the lift distance" if clearance is None else f"{clearance*100:.2f} cm"
+        return f"via a point {where} above the suturing pose, then straight down"
+
+
 @dataclass
 class GraspLiftPlan:
-    """The frozen geometry of one episode."""
+    """The frozen geometry of one episode.
+
+    ``start -> [staged] -> grasp -> lifted -> [via] -> [suture]``
+
+    The bracketed waypoints are optional, so a plain grasp-and-lift plan is the
+    same object with them left as None.  ``staged`` is where the arm is put so
+    the approach policy starts inside its own training support; ``suture`` is
+    where the needle is presented at the entry point.
+    """
 
     start: Pose
     grasp: Pose
     lifted: Pose
     lift_spec: LiftSpec
     jaw: JawCalibration
+    #: pose to servo to before handing over to the approach policy
+    staged: Optional[Pose] = None
+    #: final tool pose at the suturing point, with the needle angled
+    suture: Optional[Pose] = None
+    transport_spec: Optional[TransportSpec] = None
+
+    @property
+    def via(self) -> Optional[Pose]:
+        if self.suture is None:
+            return None
+        spec = self.transport_spec or TransportSpec()
+        return spec.via_pose(self.suture, self.lift_spec, self.grasp)
+
+    @property
+    def waypoints(self) -> list:
+        """Every pose the arm is asked to reach, in order, named."""
+        out = [("start", self.start)]
+        if self.staged is not None:
+            out.append(("staged", self.staged))
+        out += [("grasp", self.grasp), ("lifted", self.lifted)]
+        if self.suture is not None:
+            if (via := self.via) is not None:
+                out.append(("via", via))
+            out.append(("suture", self.suture))
+        return out
+
+    @property
+    def transport_travel_cm(self) -> float:
+        if self.suture is None:
+            return 0.0
+        legs = [self.lifted] + [p for n, p in self.waypoints if n in ("via", "suture")]
+        return float(
+            sum(np.linalg.norm(b.p - a.p) for a, b in zip(legs, legs[1:])) * 100.0
+        )
+
+    @property
+    def transport_rotation_deg(self) -> float:
+        if self.suture is None:
+            return 0.0
+        return float(np.degrees(rotation_error_rad(self.lifted, self.suture)))
 
     # -- derived -----------------------------------------------------------
     @property
@@ -112,19 +210,31 @@ class GraspLiftPlan:
         """Furthest any waypoint sits from the measured start pose."""
         return float(
             max(
-                np.linalg.norm(self.grasp.p - self.start.p),
-                np.linalg.norm(self.lifted.p - self.start.p),
+                np.linalg.norm(pose.p - self.start.p)
+                for _, pose in self.waypoints
             )
             * 100.0
         )
 
     def bounding_box_m(self, pad_cm: float = 2.0):
-        """Axis-aligned box covering all three waypoints, plus padding."""
-        pts = np.stack([self.start.p, self.grasp.p, self.lifted.p])
+        """Axis-aligned box covering every waypoint, plus padding."""
+        pts = np.stack([pose.p for _, pose in self.waypoints])
         pad = float(pad_cm) / 100.0
         return pts.min(axis=0) - pad, pts.max(axis=0) + pad
 
     def as_dict(self) -> dict:
+        extra = {}
+        if self.staged is not None:
+            extra["staged_cm"] = (self.staged.p * 100.0).tolist()
+            extra["staged_quat_xyzw"] = self.staged.quat_xyzw().tolist()
+        if self.suture is not None:
+            extra["suture_cm"] = (self.suture.p * 100.0).tolist()
+            extra["suture_quat_xyzw"] = self.suture.quat_xyzw().tolist()
+            extra["transport_travel_cm"] = self.transport_travel_cm
+            extra["transport_rotation_deg"] = self.transport_rotation_deg
+            extra["transport"] = (self.transport_spec or TransportSpec()).describe()
+            if (via := self.via) is not None:
+                extra["via_cm"] = (via.p * 100.0).tolist()
         return {
             "start_cm": (self.start.p * 100.0).tolist(),
             "grasp_cm": (self.grasp.p * 100.0).tolist(),
@@ -134,6 +244,7 @@ class GraspLiftPlan:
             "approach_travel_cm": self.approach_travel_cm,
             "approach_rotation_deg": self.approach_rotation_deg,
             "lift_travel_cm": self.lift_travel_cm,
+            **extra,
             "lift": {
                 "axis": self.lift_spec.axis,
                 "sign": int(self.lift_spec.sign),
@@ -189,8 +300,24 @@ def build_plan(
     goal_quat_xyzw: Optional[tuple] = None,
     lift: Optional[LiftSpec] = None,
     jaw: Optional[JawCalibration] = None,
+    suture_position_m=None,
+    suture_quat_xyzw: Optional[tuple] = None,
+    transport: Optional[TransportSpec] = None,
+    stage_contract=None,
+    stage_offset_tool_cm=None,
+    stage_rotation_deg: Optional[float] = None,
 ) -> GraspLiftPlan:
-    """Freeze the episode geometry from a measured start pose and a grasp point."""
+    """Freeze the episode geometry from a measured start pose and a grasp point.
+
+    ``suture_position_m`` / ``suture_quat_xyzw`` extend the episode through the
+    transport to the suturing point.  They describe the **tool** pose -- what
+    ``measured_cp`` should read when the needle is where it belongs -- not the
+    needle pose: after a blind grasp the needle-in-jaw transform is unknown, so
+    a needle-frame target could not be converted into a command.
+
+    ``stage_contract`` inserts a staging pose in front of the approach, solved
+    so that the approach leg starts inside that contract's training support.
+    """
     lift = lift or LiftSpec()
     jaw = jaw or JawCalibration()
 
@@ -209,6 +336,38 @@ def build_plan(
         grasp_R.copy(),
         jaw.normalise(jaw.grip_rad),
     )
+
+    suture_pose = None
+    if suture_position_m is not None:
+        suture_p = np.asarray(suture_position_m, dtype=np.float64).reshape(3)
+        if not np.isfinite(suture_p).all():
+            raise ValueError("suture position must be finite")
+        if suture_quat_xyzw is None:
+            raise ValueError(
+                "a suturing position needs its orientation too: the whole point "
+                "of the leg is to present the needle at an angle, so "
+                "suture_quat_xyzw is not optional"
+            )
+        suture_pose = Pose(
+            suture_p,
+            Pose.from_pos_quat([0.0, 0.0, 0.0], suture_quat_xyzw).R,
+            jaw.normalise(jaw.grip_rad),
+        )
+        transport = transport or TransportSpec()
+
+    staged_pose = None
+    if stage_contract is not None:
+        from .staging import stage_pose_for
+
+        staged_pose = stage_pose_for(
+            grasp_pose,
+            stage_contract,
+            offset_tool_cm=stage_offset_tool_cm,
+            rotation_deg=stage_rotation_deg,
+            jaw=jaw.normalise(jaw.approach_open_rad),
+        )
+
     return GraspLiftPlan(
-        start=start, grasp=grasp_pose, lifted=lifted_pose, lift_spec=lift, jaw=jaw
+        start=start, grasp=grasp_pose, lifted=lifted_pose, lift_spec=lift, jaw=jaw,
+        staged=staged_pose, suture=suture_pose, transport_spec=transport,
     )

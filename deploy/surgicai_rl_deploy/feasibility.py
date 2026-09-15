@@ -33,6 +33,7 @@ from .contract import (
     R6_START_ROT_DEG_MIN,
     SUPPORT_EPS_CM,
 )
+from .frames import rotation_error_rad
 from .jaw import JawBaseline
 from .plan import GraspLiftPlan
 
@@ -114,25 +115,37 @@ def precheck(
     max_step_rotation_deg: float = 5.0,
     approach_max_steps: int = 200,
     lift_max_steps: int = 120,
+    transport_max_steps: int = 600,
+    place_max_steps: int = 400,
     success_trans_cm: float = 1.0,
     success_rot_deg: float = 10.0,
+    suture_confirmed: bool = False,
+    stage_contract=None,
     strict: bool = False,
 ) -> PrecheckReport:
     report = PrecheckReport(strict=strict)
 
     # -- 1. the numbers themselves -----------------------------------------
-    pts = np.stack([plan.start.p, plan.grasp.p, plan.lifted.p])
+    waypoints = plan.waypoints
+    pts = np.stack([pose.p for _, pose in waypoints])
     if not np.isfinite(pts).all():
         report.add("inputs", FAIL, "a waypoint is not finite")
         return report
+    summary = (
+        f"approach {plan.approach_travel_cm:.2f} cm / "
+        f"{plan.approach_rotation_deg:.1f} deg, lift {plan.lift_travel_cm:.2f} cm"
+    )
+    if plan.suture is not None:
+        summary += (
+            f", transport {plan.transport_travel_cm:.2f} cm / "
+            f"{plan.transport_rotation_deg:.1f} deg"
+        )
     report.add(
         "inputs",
         PASS,
-        f"approach {plan.approach_travel_cm:.2f} cm / "
-        f"{plan.approach_rotation_deg:.1f} deg, lift {plan.lift_travel_cm:.2f} cm",
-        start_cm=(plan.start.p * 100).tolist(),
-        grasp_cm=(plan.grasp.p * 100).tolist(),
-        lifted_cm=(plan.lifted.p * 100).tolist(),
+        f"{len(waypoints)} waypoints: " + " -> ".join(n for n, _ in waypoints)
+        + ".  " + summary,
+        **{f"{name}_cm": (pose.p * 100).tolist() for name, pose in waypoints},
     )
 
     # -- 2. the lift direction is a human decision -------------------------
@@ -182,6 +195,114 @@ def precheck(
             "lift_vs_approach", WARN, "start and grasp coincide; no approach direction"
         )
 
+    # -- 3b. the suturing leg ----------------------------------------------
+    if plan.suture is not None:
+        if suture_confirmed:
+            report.add(
+                "suture_pose",
+                PASS,
+                "operator-confirmed tool pose at the suturing point",
+                suture_cm=(plan.suture.p * 100).tolist(),
+                suture_quat_xyzw=plan.suture.quat_xyzw().tolist(),
+            )
+        else:
+            report.add(
+                "suture_pose",
+                FAIL if execute else WARN,
+                "the suturing pose was not confirmed (--suture-confirmed). It is "
+                "the TOOL pose -- what measured_cp should read -- not the needle "
+                "pose. Where the needle ends up also depends on how it sits in "
+                "the jaws, which nothing here measures, so this number has to "
+                "come from someone who looked at the scene.",
+            )
+
+        lift_dir = plan.lift_spec.direction(plan.grasp)
+        if plan.via is None:
+            report.add(
+                "transport_clearance",
+                WARN,
+                "transport is set to 'direct', so the path from the lift pose to "
+                "the suturing pose is a straight line. With a needle in the jaws "
+                "that line can pass below the tissue plane in the middle. "
+                "--transport-via lift_height goes over the top instead.",
+            )
+        else:
+            drop = float(np.dot(plan.suture.p - plan.via.p, -lift_dir) * 100.0)
+            lateral = float(
+                np.linalg.norm(
+                    (plan.suture.p - plan.via.p) + lift_dir * np.dot(
+                        plan.suture.p - plan.via.p, lift_dir
+                    )
+                ) * 100.0
+            )
+            if drop <= 0.0:
+                report.add(
+                    "transport_clearance",
+                    FAIL,
+                    f"the final segment moves {abs(drop):.2f} cm along the lift "
+                    "direction rather than against it, so the 'descent' onto the "
+                    "suturing point is actually a retreat. Check --lift-sign.",
+                    drop_cm=drop,
+                )
+            else:
+                report.add(
+                    "transport_clearance",
+                    PASS,
+                    f"transport travels at height then descends {drop:.2f} cm onto "
+                    f"the suturing pose (lateral drift during the descent "
+                    f"{lateral:.3f} cm)",
+                    drop_cm=drop,
+                    lateral_cm=lateral,
+                )
+
+        turn = plan.transport_rotation_deg
+        report.add(
+            "transport_rotation",
+            WARN if turn > 120.0 else PASS,
+            f"the wrist turns {turn:.1f} deg between the lift pose and the "
+            "suturing pose"
+            + (
+                ". That is a large rotation to make with a needle held; check it "
+                "does not sweep the needle through anything, and that the wrist "
+                "does not pass through a singularity."
+                if turn > 120.0 else ""
+            ),
+            rotation_deg=turn,
+        )
+
+    # -- 3c. is the approach policy being started in distribution? ---------
+    if stage_contract is not None:
+        from .staging import support_report
+
+        origin = plan.staged if plan.staged is not None else plan.start
+        rep = support_report(origin, plan.grasp, stage_contract)
+        where = "staging pose" if plan.staged is not None else "measured start pose"
+        if rep["in_support"]:
+            report.add(
+                "training_support",
+                PASS,
+                f"the {where} puts the approach leg inside {stage_contract.name}'s "
+                f"demonstrated support (margin "
+                f"{np.min(rep['box_margin_cm']):.2f} cm, "
+                f"{rep['rotation_margin_deg']:.1f} deg)",
+                offset_tool_cm=rep["offset_tool_cm"].tolist(),
+                rotation_deg=rep["rotation_deg"],
+            )
+        else:
+            report.add(
+                "training_support",
+                WARN if controller in ("rl", "residual") else PASS,
+                f"the {where} is outside {stage_contract.name}'s demonstrated "
+                f"support: {'; '.join(rep['reasons'])}"
+                + (
+                    "" if controller in ("rl", "residual")
+                    else ". Reported for comparison only -- the geometric servo "
+                         "has no trained region."
+                ),
+                offset_tool_cm=rep["offset_tool_cm"].tolist(),
+                rotation_deg=rep["rotation_deg"],
+            )
+
     # -- 4. reachability, as a radius around the measured start ------------
     radius = plan.path_radius_cm()
     if radius > max_path_radius_cm:
@@ -212,12 +333,8 @@ def precheck(
         else:
             outside = [
                 name
-                for name, p in (
-                    ("start", plan.start.p),
-                    ("grasp", plan.grasp.p),
-                    ("lifted", plan.lifted.p),
-                )
-                if np.any(p < low) or np.any(p > high)
+                for name, pose in waypoints
+                if np.any(pose.p < low) or np.any(pose.p > high)
             ]
             if outside:
                 report.add(
@@ -246,10 +363,34 @@ def precheck(
     # -- 6. can the segments finish inside their step budgets? -------------
     step_m = max_step_translation_mm / 1000.0
     step_deg = max(max_step_rotation_deg, 1e-6)
-    for seg, travel_cm, rot_deg, budget in (
-        ("approach", plan.approach_travel_cm, plan.approach_rotation_deg, approach_max_steps),
+    segments = [
+        ("approach", plan.approach_travel_cm, plan.approach_rotation_deg,
+         approach_max_steps),
         ("lift", plan.lift_travel_cm, 0.0, lift_max_steps),
-    ):
+    ]
+    if plan.staged is not None:
+        segments.insert(0, (
+            "stage",
+            float(np.linalg.norm(plan.staged.p - plan.start.p) * 100.0),
+            float(np.degrees(rotation_error_rad(plan.start, plan.staged))),
+            approach_max_steps,
+        ))
+    if plan.suture is not None:
+        via = plan.via or plan.suture
+        segments.append((
+            "transport",
+            float(np.linalg.norm(via.p - plan.lifted.p) * 100.0),
+            float(np.degrees(rotation_error_rad(plan.lifted, via))),
+            transport_max_steps,
+        ))
+        if plan.via is not None:
+            segments.append((
+                "place",
+                float(np.linalg.norm(plan.suture.p - via.p) * 100.0),
+                float(np.degrees(rotation_error_rad(via, plan.suture))),
+                place_max_steps,
+            ))
+    for seg, travel_cm, rot_deg, budget in segments:
         # A proportional servo never moves a full step near the goal, so the
         # geometric minimum is doubled to leave convergence headroom.
         need = 2.0 * max(travel_cm / 100.0 / step_m, rot_deg / step_deg)
