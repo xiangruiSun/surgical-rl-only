@@ -31,6 +31,7 @@ from .contract import (
     R6_START_OFFSET_TOOL_MIN,
     R6_START_ROT_DEG_MAX,
     R6_START_ROT_DEG_MIN,
+    SUPPORT_EPS_CM,
 )
 from .jaw import JawBaseline
 from .plan import GraspLiftPlan
@@ -346,7 +347,10 @@ def precheck(
     offenders = []
     axes = "xyz"
     for i in range(3):
-        if dp_tool_cm[i] < R6_START_OFFSET_TOOL_MIN[i] or dp_tool_cm[i] > R6_START_OFFSET_TOOL_MAX[i]:
+        if (
+            dp_tool_cm[i] < R6_START_OFFSET_TOOL_MIN[i] - SUPPORT_EPS_CM
+            or dp_tool_cm[i] > R6_START_OFFSET_TOOL_MAX[i] + SUPPORT_EPS_CM
+        ):
             offenders.append(
                 f"tool-{axes[i]} {dp_tool_cm[i]:+.2f} cm outside "
                 f"[{R6_START_OFFSET_TOOL_MIN[i]:+.2f}, {R6_START_OFFSET_TOOL_MAX[i]:+.2f}]"

@@ -65,6 +65,12 @@ R6_GOAL_MAX = np.array([-2.716, 2.543, -11.441, -2.763, 0.927, 2.843, 0.0])
 R6_START_OFFSET_TOOL_MIN = np.array([-1.354, 0.948, 0.699])
 R6_START_OFFSET_TOOL_MAX = np.array([3.211, 3.948, 4.415])
 R6_START_OFFSET_TOOL_MEAN = np.array([0.960, 2.445, 2.661])
+
+# Tolerance for testing membership of that box.  Its edges are the min and max
+# of 50 samples, not a physical boundary, so a pose sitting exactly on a face
+# must not be called out-of-support by floating-point noise.  Every place that
+# tests the support imports this, so the answers cannot disagree.
+SUPPORT_EPS_CM = 1.0e-9
 # Geodesic rotation from start orientation to goal orientation, degrees.
 R6_START_ROT_DEG_MIN = 25.7
 R6_START_ROT_DEG_MAX = 100.2

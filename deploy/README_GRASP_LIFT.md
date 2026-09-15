@@ -19,7 +19,8 @@ surgicai_rl_deploy/
 tools/
   calibrate_jaw.py           what an empty close looks like on YOUR arm
   offline_grasp_lift.py      replay the whole sequence with no robot
-tests/                       145 tests, no ROS or robot required
+  plan_r6_start.py           solve a start pose inside the RL policy's support
+tests/                       163 tests, no ROS or robot required
 ```
 
 ---
@@ -91,6 +92,66 @@ One `fail` and nothing is published. `--strict` makes every warning fatal.
 The R6 support numbers are still printed under the servo, so you can see what
 the RL path *would* have complained about and compare the two controllers on
 the same real goal.
+
+---
+
+## Putting the RL policy back in distribution
+
+The R6 support is two constraints on the *relative* geometry between the start
+pose and the grasp pose:
+
+```
+tool offset   R_startᵀ·(p_grasp − p_start)   in [−1.35, 0.95, 0.70] … [3.21, 3.95, 4.42] cm
+rotation      geodesic(R_start, R_grasp)      in [25.7, 100.2] deg
+```
+
+Both are **invariant under the frame bridge** — a rigid transform cancels in
+the tool offset and leaves a geodesic unchanged — so they can be satisfied by
+choosing the start pose in the robot's own frame, and `--frame-mode rebase`
+then puts the absolute goal on top of the trained one. With the grasp pose
+fixed the solve is direct:
+
+```
+R_start = R_grasp · Rel⁻¹        Rel = the demonstrations' mean start→goal rotation
+p_start = p_grasp − R_start · offset
+```
+
+`tools/plan_r6_start.py` does it and prints the three commands that follow:
+
+```bash
+python3 tools/plan_r6_start.py \
+  --grasp-pos  <x y z> --grasp-quat <qx qy qz qw> \
+  --current-pos <x y z> --current-quat <qx qy qz qw>
+```
+
+It reports where the solved pose sits in the box, the margin to each face, and
+how far the arm must travel and turn to get there. Sitting at the
+demonstrations' mean offset leaves more than 1 cm of margin on every axis and
+31° on the rotation, so a millimetre of positioning error cannot push the
+episode back out of support.
+
+**This removes the out-of-distribution excuse. It does not promise the policy
+works.** Run `tools/offline_check.py --controller rl --model ...` on the solved
+pair before moving anything, and compare against `--controller d2` on the same
+pair. If the policy still will not converge from an in-support start, the
+geometry was never what was wrong with it — and that is a result worth having.
+
+Two things the solve cannot tell you: whether the pose is **reachable**, and
+whether the wrist can get there without sweeping through something. Reorienting
+to the solved start typically means a large wrist rotation, because the support
+*requires* the start and grasp orientations to differ by 25–100°. Move there
+with the servo and a tight tolerance, watching the arm:
+
+```bash
+python3 run_approach.py --goal-pos <solved> --goal-quat <solved> \
+  --goal-orientation explicit --controller d2 --interface move_cp --rate 2 \
+  --success-trans-cm 0.2 --success-rot-deg 2.0 --execute
+```
+
+The demonstrations also started with the jaw at 0.76 normalised, which is 45.6°
+on the default calibration; the jaw is part of the observation, so
+`--jaw-approach-open-deg 45.6` is worth matching for the policy run. Close and
+lift stay on the geometric servo regardless of what drives the approach.
 
 ---
 
@@ -297,7 +358,7 @@ why the real run makes you state it.
 ## Tests
 
 ```bash
-python3 -m pytest tests -q        # 145 tests, no ROS and no robot
+python3 -m pytest tests -q        # 163 tests, no ROS and no robot
 ```
 
 Covers the jaw mapping and evidence logic, the lift geometry, every precheck

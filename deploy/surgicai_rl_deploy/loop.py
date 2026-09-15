@@ -30,6 +30,7 @@ from .contract import (
     R6_START_ROT_DEG_MAX,
     R6_START_ROT_DEG_MIN,
     R6_TRAINED_GOAL_VEC7,
+    SUPPORT_EPS_CM,
     STEP_SIZE_RAW,
     SUCCESS_ROT_RAD,
     SUCCESS_TRANS_CM,
@@ -174,8 +175,8 @@ class ApproachLoop:
         dp_tool_cm = start_policy.R.T @ dp_world_cm
         rot_deg = np.degrees(rotation_error_rad(start_policy, goal_policy))
 
-        below = dp_tool_cm < R6_START_OFFSET_TOOL_MIN
-        above = dp_tool_cm > R6_START_OFFSET_TOOL_MAX
+        below = dp_tool_cm < R6_START_OFFSET_TOOL_MIN - SUPPORT_EPS_CM
+        above = dp_tool_cm > R6_START_OFFSET_TOOL_MAX + SUPPORT_EPS_CM
         axes = "xyz"
         offenders = [
             f"tool-{axes[i]} {dp_tool_cm[i]:+.2f} cm outside "
