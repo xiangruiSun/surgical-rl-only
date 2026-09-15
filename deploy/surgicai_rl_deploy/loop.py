@@ -38,9 +38,11 @@ from .contract import (
 from .frames import (
     FrameBridge,
     Pose,
+    bound_roll,
     rotation_error_rad,
     translation_error_cm,
     unwrap_rpy_to,
+    vec7_bound,
 )
 from .obs import build_observation
 
@@ -59,6 +61,13 @@ class SafetyLimits:
     max_tracking_error_cm: float = 1.5
     #: abort if measured_cp goes stale (ROS node only)
     max_pose_age_s: float = 0.25
+    #: abort after this many consecutive cycles in which a safety clamp had to
+    #: modify the command.  With an open-loop observation (the training
+    #: contract) the policy's internal state keeps integrating while the clamp
+    #: holds the robot back, so sustained clamping means the policy and the arm
+    #: have quietly stopped agreeing about where the tool is.  That is the state
+    #: in which a "small" next command can be a large real motion.  0 disables.
+    max_consecutive_clamps: int = 12
 
 
 @dataclass
@@ -85,6 +94,79 @@ class LoopConfig:
         default_factory=lambda: np.asarray(STEP_SIZE_RAW, dtype=np.float64)
     )
 
+    # -- the three fidelity switches ---------------------------------------
+    #: ``"command"`` (the training contract) or ``"measured"``.
+    #:
+    #: ``RL/subtask_env.py :: step`` reads
+    #:
+    #:     current = self.psm_goal_list[self.psm_idx-1]
+    #:     self.psm_goal_list[self.psm_idx-1] = current + action*step_size
+    #:     self._update_observation(self.psm_goal_list[self.psm_idx-1])
+    #:
+    #: ``measured_cp`` is never read back inside a subtask.  The observation is
+    #: therefore a pure integrator over the commands, and the policy is
+    #: open-loop within an episode.  Feeding it the measured pose instead --
+    #: which this package did until now -- looks harmless on a perfect
+    #: kinematic arm and is not: on real hardware the arm lags the command, so
+    #: the achieved block, the desired-minus-achieved block and the next
+    #: integration step all drift away from anything the policy saw in
+    #: training, a little more on every cycle.
+    #:
+    #: Geometric servo segments want the opposite -- they should react to where
+    #: the arm actually is -- so they pass ``"measured"`` explicitly.
+    observation_source: str = "command"
+    #: ``"surgicai_bound"`` reproduces ``Frame2Vec(bound=True)`` exactly: roll in
+    #: ``(-2*pi, 0]``, pitch and yaw untouched.  ``"unwrap"`` is the older
+    #: reference-based heuristic, kept so the two can be compared.
+    #: ``"canonical"`` is scipy's ``[-pi, pi]``, i.e. the defect, kept only so a
+    #: test can pin what it did.
+    rpy_convention: str = "surgicai_bound"
+    #: ``"rpy_norm"`` is SurgicAI's own success test -- the Euclidean norm of the
+    #: RPY difference vector, which is what the reported 96%/97% were measured
+    #: with.  ``"geodesic"`` is the true angle between the two orientations.
+    #: They are different numbers; both are always reported.
+    rot_metric: str = "geodesic"
+    #: Seed the policy's internal jaw channel with this normalised value rather
+    #: than the measured jaw.  The Approach demonstrations all begin at 0.80 and
+    #: end at 0.00, and the jaw is 3 of the 21 observation dimensions, so a jaw
+    #: channel pinned at whatever the gripper happens to be doing is off
+    #: distribution from the first cycle.  None = use the measured jaw.
+    policy_jaw_start: Optional[float] = None
+    #: Let the action integrate the internal jaw channel even when the physical
+    #: jaw is held open by the sequencer.  This is what training did; the
+    #: deliberate deviation is that we do not *publish* that jaw command during
+    #: the approach.
+    integrate_policy_jaw: bool = True
+    #: Re-seed the internal state from the clamped command whenever a safety
+    #: clamp fires.  Off by default: it hides divergence that
+    #: ``max_consecutive_clamps`` is there to catch.
+    resync_state_on_clamp: bool = False
+
+    def __post_init__(self):
+        if self.observation_source not in ("command", "measured"):
+            raise ValueError(
+                f"observation_source must be 'command' or 'measured'; "
+                f"got {self.observation_source!r}"
+            )
+        if self.rpy_convention not in ("surgicai_bound", "unwrap", "canonical"):
+            raise ValueError(f"unknown rpy_convention {self.rpy_convention!r}")
+        if self.rot_metric not in ("geodesic", "rpy_norm"):
+            raise ValueError(f"unknown rot_metric {self.rot_metric!r}")
+
+    @classmethod
+    def from_contract(cls, contract, **overrides) -> "LoopConfig":
+        """Build a config whose action scale and tolerances match a checkpoint."""
+        base = dict(
+            step_size=np.asarray(contract.step_size, dtype=np.float64),
+            max_steps=int(contract.max_steps),
+            success_trans_cm=float(contract.success_trans_cm),
+            success_rot_rad=float(contract.success_rot_rad),
+            policy_jaw_start=float(contract.demo_start_jaw),
+            goal_jaw=str(float(contract.demo_goal_jaw)),
+        )
+        base.update(overrides)
+        return cls(**base)
+
 
 @dataclass
 class StepResult:
@@ -97,15 +179,30 @@ class StepResult:
     done: bool
     reason: str
     clamps: list = field(default_factory=list)
+    #: error between the policy's *internal* state and the goal, in the policy
+    #: frame.  With an open-loop observation this is what the policy believes;
+    #: ``trans_err_cm`` above is what the arm actually did.  A growing gap
+    #: between the two is the signature of an arm that is not tracking.
+    state_trans_err_cm: float = float("nan")
+    state_rot_err_deg: float = float("nan")
+    #: SurgicAI's own rotation metric, ||rpy_achieved - rpy_desired||, radians
+    rpy_norm_err_rad: float = float("nan")
+    #: the policy's internal 7-vector this cycle, policy frame, raw units
+    state_vec7: Optional[np.ndarray] = None
 
 
 class ApproachLoop:
     def __init__(self, controller, config: Optional[LoopConfig] = None,
-                 limits: Optional[SafetyLimits] = None):
+                 limits: Optional[SafetyLimits] = None, contract=None):
         self.controller = controller
         self.cfg = config or LoopConfig()
         self.limits = limits or SafetyLimits()
-        self.trained_goal = Pose.from_vec7(R6_TRAINED_GOAL_VEC7)
+        self.contract = contract
+        trained_goal_vec7 = (
+            R6_TRAINED_GOAL_VEC7 if contract is None else contract.trained_goal_vec7
+        )
+        self.trained_goal = Pose.from_vec7(trained_goal_vec7)
+        self._trained_goal_vec7 = np.asarray(trained_goal_vec7, dtype=np.float64)
 
         self.start: Optional[Pose] = None
         self.goal_robot: Optional[Pose] = None
@@ -116,6 +213,11 @@ class ApproachLoop:
         self._box_low = None
         self._box_high = None
         self._goal_rpy = None
+        #: the policy's internal state, policy frame, raw units.  This is the
+        #: `psm_goal_list` of the training environment.
+        self._state_vec7: Optional[np.ndarray] = None
+        self._goal_vec7: Optional[np.ndarray] = None
+        self._clamp_streak = 0
 
     # ------------------------------------------------------------------
     # setup
@@ -166,20 +268,55 @@ class ApproachLoop:
             # Numerically identical to the trained goal; keep the jaw we chose.
             self.goal_policy = self.trained_goal.with_jaw(goal_jaw)
 
-        if self.cfg.goal_rpy_train is not None:
+        goal_vec7 = self.goal_policy.to_vec7()
+        if self._convention() == "canonical":
+            # "canonical" means *reproduce the defect exactly*, which includes
+            # ignoring any stated training branch.  It exists so a test can pin
+            # what the broken path did; nothing else should select it.
+            self._goal_rpy = goal_vec7[3:6].copy()
+        elif self.cfg.goal_rpy_train is not None:
             self._goal_rpy = np.asarray(self.cfg.goal_rpy_train, dtype=np.float64)
         elif self.cfg.frame_mode == "rebase":
             # goal_policy IS the trained goal, so its contract RPY is the branch.
-            self._goal_rpy = np.asarray(R6_TRAINED_GOAL_VEC7[3:6], dtype=np.float64)
+            self._goal_rpy = self._trained_goal_vec7[3:6].copy()
         else:
-            self._goal_rpy = self.goal_policy.to_vec7()[3:6]
+            self._goal_rpy = self._on_branch(goal_vec7[3:6], reference=goal_vec7[3:6])
+        goal_vec7[3:6] = self._goal_rpy
+        self._goal_vec7 = goal_vec7
+
+        # Seed the policy's internal state.  From here on the episode is an
+        # integrator: no pose is ever re-derived from a rotation matrix again,
+        # which is precisely why the branch cannot drift.
+        start_policy = self.bridge.to_policy(start)
+        state = start_policy.to_vec7()
+        state[3:6] = self._on_branch(state[3:6], reference=self._goal_rpy)
+        if self.cfg.policy_jaw_start is not None:
+            state[6] = float(self.cfg.policy_jaw_start)
+        self._state_vec7 = state
 
         lo = np.minimum(start.p, goal_p) - self.limits.workspace_pad_cm / 100.0
         hi = np.maximum(start.p, goal_p) + self.limits.workspace_pad_cm / 100.0
         self._box_low, self._box_high = lo, hi
         self.last_command = None
         self.index = 0
+        self._clamp_streak = 0
         return self.distribution_report()
+
+    # ------------------------------------------------------------------
+    def _convention(self) -> str:
+        """``unwrap_rpy=False`` is the legacy switch for "leave it canonical"."""
+        return self.cfg.rpy_convention if self.cfg.unwrap_rpy else "canonical"
+
+    def _on_branch(self, rpy, reference=None) -> np.ndarray:
+        convention = self._convention()
+        rpy = np.asarray(rpy, dtype=np.float64)
+        if convention == "surgicai_bound":
+            return bound_roll(rpy)
+        if convention == "unwrap":
+            if reference is None:
+                return rpy.copy()
+            return unwrap_rpy_to(rpy, reference)
+        return rpy.copy()
 
     # ------------------------------------------------------------------
     # in-distribution report
@@ -193,21 +330,25 @@ class ApproachLoop:
         dp_tool_cm = start_policy.R.T @ dp_world_cm
         rot_deg = np.degrees(rotation_error_rad(start_policy, goal_policy))
 
-        below = dp_tool_cm < R6_START_OFFSET_TOOL_MIN - SUPPORT_EPS_CM
-        above = dp_tool_cm > R6_START_OFFSET_TOOL_MAX + SUPPORT_EPS_CM
-        axes = "xyz"
-        offenders = [
-            f"tool-{axes[i]} {dp_tool_cm[i]:+.2f} cm outside "
-            f"[{R6_START_OFFSET_TOOL_MIN[i]:+.2f}, {R6_START_OFFSET_TOOL_MAX[i]:+.2f}]"
-            for i in range(3)
-            if below[i] or above[i]
-        ]
-        if not (R6_START_ROT_DEG_MIN <= rot_deg <= R6_START_ROT_DEG_MAX):
-            offenders.append(
-                f"start->goal rotation {rot_deg:.1f} deg outside "
-                f"[{R6_START_ROT_DEG_MIN:.1f}, {R6_START_ROT_DEG_MAX:.1f}]"
-            )
+        if self.contract is not None:
+            offenders = self.contract.in_support(dp_tool_cm, rot_deg)
+        else:
+            below = dp_tool_cm < R6_START_OFFSET_TOOL_MIN - SUPPORT_EPS_CM
+            above = dp_tool_cm > R6_START_OFFSET_TOOL_MAX + SUPPORT_EPS_CM
+            axes = "xyz"
+            offenders = [
+                f"tool-{axes[i]} {dp_tool_cm[i]:+.2f} cm outside "
+                f"[{R6_START_OFFSET_TOOL_MIN[i]:+.2f}, {R6_START_OFFSET_TOOL_MAX[i]:+.2f}]"
+                for i in range(3)
+                if below[i] or above[i]
+            ]
+            if not (R6_START_ROT_DEG_MIN <= rot_deg <= R6_START_ROT_DEG_MAX):
+                offenders.append(
+                    f"start->goal rotation {rot_deg:.1f} deg outside "
+                    f"[{R6_START_ROT_DEG_MIN:.1f}, {R6_START_ROT_DEG_MAX:.1f}]"
+                )
         return {
+            "contract": None if self.contract is None else self.contract.name,
             "frame_mode": self.cfg.frame_mode,
             "start_offset_tool_cm": dp_tool_cm,
             "start_offset_policy_frame_cm": dp_world_cm,
@@ -256,6 +397,19 @@ class ApproachLoop:
             )
         return Pose(p, R_cmd, command.jaw), clamps
 
+    def _terminal(self, measured: Pose, reason: str) -> StepResult:
+        return StepResult(
+            self.index,
+            np.zeros(7),
+            self.last_command or measured,
+            measured,
+            translation_error_cm(measured, self.goal_robot),
+            float(np.degrees(rotation_error_rad(measured, self.goal_robot))),
+            True,
+            reason,
+            state_vec7=None if self._state_vec7 is None else self._state_vec7.copy(),
+        )
+
     def step(self, measured: Pose) -> StepResult:
         if self.bridge is None:
             raise RuntimeError("call begin() before step()")
@@ -265,22 +419,26 @@ class ApproachLoop:
         if self.last_command is not None:
             lag = translation_error_cm(measured, self.last_command)
             if lag > self.limits.max_tracking_error_cm:
-                return StepResult(
-                    self.index, np.zeros(7), self.last_command, measured,
-                    translation_error_cm(measured, self.goal_robot),
-                    float(np.degrees(rotation_error_rad(measured, self.goal_robot))),
-                    True, f"abort: tracking error {lag:.2f} cm exceeds limit",
+                return self._terminal(
+                    measured, f"abort: tracking error {lag:.2f} cm exceeds limit"
                 )
 
         measured_policy = self.bridge.to_policy(measured)
+        goal_vec7 = self._goal_vec7
 
-        cur_vec7 = measured_policy.to_vec7()
-        goal_vec7 = self.goal_policy.to_vec7()
-        if self.cfg.unwrap_rpy:
-            cur_vec7[3:6] = unwrap_rpy_to(cur_vec7[3:6], self._goal_rpy)
-            goal_vec7[3:6] = self._goal_rpy
+        if self.cfg.observation_source == "measured":
+            state_vec7 = measured_policy.to_vec7()
+            state_vec7[3:6] = self._on_branch(state_vec7[3:6], reference=self._goal_rpy)
+            if self.cfg.policy_jaw_start is not None:
+                # the jaw channel stays on the integrator even when the pose
+                # channels are closed-loop: the physical gripper is deliberately
+                # not doing what the policy asked during the approach
+                state_vec7[6] = self._state_vec7[6]
+        else:
+            state_vec7 = self._state_vec7.copy()
+
         obs = build_observation(
-            cur_vec7,
+            state_vec7,
             goal_vec7,
             align_rpy_branch=self.cfg.align_rpy_branch,
             wrap_rpy_delta=self.cfg.wrap_rpy_delta,
@@ -288,7 +446,12 @@ class ApproachLoop:
         action = np.asarray(self.controller.act(obs), dtype=np.float64).reshape(7)
         action = np.clip(action, -1.0, 1.0)
 
-        cmd_vec7 = cur_vec7 + action * self.cfg.step_size
+        next_state = state_vec7 + action * self.cfg.step_size
+        if not self.cfg.integrate_policy_jaw:
+            next_state[6] = state_vec7[6]
+        self._state_vec7 = next_state
+
+        cmd_vec7 = next_state.copy()
         if not self.cfg.use_policy_jaw:
             cmd_vec7[6] = measured.jaw
 
@@ -296,12 +459,66 @@ class ApproachLoop:
         command_robot = self.bridge.to_robot(command_policy)
         command_robot, clamps = self._clamp(measured, command_robot)
 
+        if clamps:
+            self._clamp_streak += 1
+            if self.cfg.resync_state_on_clamp:
+                resynced = self.bridge.to_policy(command_robot).to_vec7()
+                resynced[3:6] = self._on_branch(
+                    resynced[3:6], reference=self._goal_rpy
+                )
+                resynced[6] = next_state[6]
+                self._state_vec7 = resynced
+        else:
+            self._clamp_streak = 0
+
+        # -- what the arm did, and what the policy believes ------------------
         trans_err = translation_error_cm(measured, self.goal_robot)
         rot_err = rotation_error_rad(measured, self.goal_robot)
 
+        # SurgicAI's criteria() compares the *integrator* to the goal, and the
+        # integrator is what makes the RPY metric meaningful: it runs free, so
+        # a wrist that rotates past +pi in yaw simply keeps counting.  Deriving
+        # the same number from a pose -- i.e. through a rotation matrix -- wraps
+        # that yaw back and reports a ~2*pi error for a millimetre of motion.
+        # The Place demonstrations sit right on that boundary (goal yaw is
+        # +-3.13 rad), so measuring them the wrong way turns a 97% policy into a
+        # 48% one.  This is the branch defect again, one channel over.
+        state_pose = Pose.from_vec7(next_state)
+        rpy_norm_err = float(np.linalg.norm(next_state[3:6] - goal_vec7[3:6]))
+        state_trans_err = float(
+            np.linalg.norm(next_state[:3] - goal_vec7[:3]) * 100.0
+        )
+        state_rot_err = float(
+            np.degrees(rotation_error_rad(state_pose, self.goal_policy))
+        )
+
+        # Two internally consistent ways to call it done, never mixed:
+        #   rpy_norm -- reproduce criteria() exactly, on the integrator
+        #   geodesic -- physical truth, on the measured pose
+        if self.cfg.rot_metric == "rpy_norm":
+            success = (
+                state_trans_err <= self.cfg.success_trans_cm
+                and rpy_norm_err <= self.cfg.success_rot_rad
+            )
+        else:
+            success = (
+                trans_err <= self.cfg.success_trans_cm
+                and rot_err <= self.cfg.success_rot_rad
+            )
+
         done, reason = False, "running"
-        if trans_err <= self.cfg.success_trans_cm and rot_err <= self.cfg.success_rot_rad:
+        if success:
             done, reason = True, "success"
+        elif (
+            self.limits.max_consecutive_clamps
+            and self._clamp_streak >= self.limits.max_consecutive_clamps
+        ):
+            kinds = sorted({c["kind"] for c in clamps})
+            done, reason = True, (
+                f"abort: safety clamp active for {self._clamp_streak} consecutive "
+                f"cycles ({', '.join(kinds)}). The controller and the arm have "
+                "stopped agreeing about where the tool is."
+            )
         elif self.index >= self.cfg.max_steps:
             done, reason = True, "max_steps"
 
@@ -309,4 +526,8 @@ class ApproachLoop:
         return StepResult(
             self.index, action.astype(np.float32), command_robot, measured,
             trans_err, float(np.degrees(rot_err)), done, reason, clamps,
+            state_trans_err_cm=state_trans_err,
+            state_rot_err_deg=state_rot_err,
+            rpy_norm_err_rad=rpy_norm_err,
+            state_vec7=next_state.copy(),
         )

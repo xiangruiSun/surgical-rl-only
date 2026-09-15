@@ -298,6 +298,13 @@ class GraspLiftSequencer:
             success_trans_cm=success_trans_cm,
             success_rot_rad=float(np.deg2rad(success_rot_deg)),
             unwrap_rpy=self.cfg.unwrap_rpy,
+            # A geometric servo is supposed to react to where the arm actually
+            # is.  The open-loop observation belongs to the policy legs, where
+            # it reproduces the training contract; here it would make the servo
+            # keep pushing at a target the arm never reached.
+            observation_source="measured",
+            integrate_policy_jaw=False,
+            rot_metric="geodesic",
         )
         loop = ApproachLoop(self.hold_controller, cfg, self.limits)
         loop.begin(measured, goal.p)

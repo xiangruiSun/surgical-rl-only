@@ -1,30 +1,40 @@
 #!/usr/bin/env python3
-"""Recover a checkpoint's action scale from its own demonstrations.
+"""Recover the scale the *demonstrations* were collected at.
 
-Why this exists
----------------
-``verify_contract.py`` proves the *observation* builder is byte-exact against
-the data stored in the checkpoint.  It says nothing about the *action* scale,
-because observations are built from poses and never touch ``STEP_SIZE_RAW``.
-That constant was read out of the training sources instead -- and a policy whose
-actions are applied at the wrong scale tracks correctly for a few steps and then
-diverges, which looks exactly like a bad policy.
-
-The demonstrations embedded in the checkpoint contain both the actions and the
-states they produced, so the scale is not a matter of belief:
+READ THIS BEFORE USING THE NUMBER
+---------------------------------
+This tool answers one narrow question exactly: at what step size do the
+transitions embedded in a checkpoint integrate?  Solving
 
     achieved[t+1] = achieved[t] + action[t] * step_size
 
-is solved per channel.  If the recovered scale reproduces the stored trajectory
-to numerical zero, that is the scale the policy was trained with, whatever the
-training sources say.
+per channel recovers that to numerical zero.
+
+**That is not necessarily the scale the policy acts at, and for the released
+SurgicAI checkpoints it is not.**  SurgicAI carries two:
+
+======================================  =======================  ==============
+source                                  Approach                 used for
+======================================  =======================  ==============
+``RL/Env_info/Approach_noise_env_info``  0.5 mm / 2 deg          the demos
+``RL/RL_training_online.py`` (and        1.0 mm / 3 deg,         training AND
+``RL/Model_evaluation.py``)              300 max steps           evaluation
+======================================  =======================  ==============
+
+Both scripts hard-code ``trans_step = 1.0e-3`` and ``angle_step = deg2rad(3)``.
+The published 96% +- 6% was measured at that scale, so that is the scale the
+actor's outputs mean.  Replaying the upstream Approach checkpoint from its own
+demonstration starts, through the deployment loop, against a perfect arm:
+
+    0.5 mm / 2 deg  (what this tool recovers)     7/20    35%
+    1.0 mm / 3 deg  (what training used)         19/20    95%
+
+So: use this tool to confirm the demonstrations parse and to detect a
+checkpoint whose demo set was collected under a different regime.  Use
+``tools/replay_demos.py --compare`` to decide what to actually drive the policy
+with -- it runs the policy instead of curve-fitting its training data.
 
     python3 tools/recover_step_size.py --model <checkpoint>
-
-Measured on the upstream SurgicAI Approach TD3_HER_BC checkpoint, the recovered
-scale is 0.5 mm / 2 deg -- matching ``RL/Env_info/Approach_noise_env_info``
-shipped beside it, and a third of the translation this package applied by
-default.
 """
 
 from __future__ import annotations
@@ -175,24 +185,29 @@ def main(argv=None) -> int:
     exact = np.median(trans) < args.tolerance_mm
     matches_package = np.allclose(step[:6], np.asarray(STEP_SIZE_RAW)[:6], rtol=1e-3)
 
-    if exact and matches_package:
-        print("The package's action scale reproduces this checkpoint's own")
-        print("demonstrations exactly. Nothing to change.")
-        code = 0
-    elif exact:
-        print("MISMATCH. The recovered scale reproduces the demonstrations exactly")
-        print("and the package's scale does not. Every action this package applies")
-        print("to this checkpoint is scaled wrongly, which makes a working policy")
-        print("track for a few steps and then diverge. Pass the recovered values:")
-        print(f"    --trans-step-mm {step[0]*1000:.4f} "
-              f"--angle-step-deg {np.degrees(step[3]):.4f} "
-              f"--jaw-step {step[6]:.4f}")
-        code = 2
+    if exact:
+        print("The demonstrations integrate cleanly at the recovered scale, so")
+        print("the demo set parses and is self-consistent.")
+        if matches_package:
+            print("It also equals the scale this package would act with.")
+        else:
+            print("It is NOT the scale this package acts with -- which may be")
+            print("perfectly correct. For the upstream SurgicAI checkpoints the")
+            print("demonstrations were collected at 0.5 mm / 2 deg while the")
+            print("policy was trained and evaluated at 1.0 mm / 3 deg")
+            print("(RL/RL_training_online.py, RL/Model_evaluation.py).")
+        print()
+        print("DO NOT pass the recovered numbers as --trans-step-mm on the")
+        print("strength of this result alone. Decide the acting scale with:")
+        print("    python3 tools/replay_demos.py --model <checkpoint> --compare")
+        print("which runs the policy instead of fitting its training data.")
+        code = 0 if matches_package else 2
     else:
-        print("The recovered scale does not reproduce the demonstrations exactly")
-        print("either, so the stored transitions are not a clean integration of")
-        print("the stored actions. Treat both scales as unverified and find the")
-        print("training configuration.")
+        print("The recovered scale does not reproduce the demonstrations exactly,")
+        print("so the stored transitions are not a clean integration of the stored")
+        print("actions. The demo set was probably collected under a different")
+        print("regime than it is stored against. Find the training configuration")
+        print("and confirm it with tools/replay_demos.py.")
         code = 3
 
     if args.json_out:

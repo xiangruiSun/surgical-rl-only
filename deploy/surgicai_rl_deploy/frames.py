@@ -40,6 +40,56 @@ def quat_xyzw_from_rpy(rpy) -> np.ndarray:
     return Rotation.from_euler("xyz", np.asarray(rpy, dtype=np.float64)).as_quat()
 
 
+def bound_roll(rpy):
+    """Put roll on SurgicAI's branch: ``(-2*pi, 0]``.
+
+    This is not a heuristic.  It is a transcription of
+    ``RL/subtask_env.py :: Frame2Vec(frame, bound=True)``::
+
+        roll, pitch, yaw = frame.M.GetRPY()
+        if roll <= np.deg2rad(-360):
+            roll += 2*np.pi
+        elif roll > np.deg2rad(0):
+            roll -= 2*np.pi
+
+    Every goal vector in every SurgicAI environment passes through that
+    function, which is why a matrix round-trip in the deployment loop -- where
+    scipy hands back roll in ``[-pi, pi]`` -- silently moved three of the
+    twenty-one observation dimensions onto a branch no policy was ever trained
+    on.  Measured over the demonstrations embedded in the released checkpoints:
+
+    ======================  ==========  =========
+    checkpoint              |roll|>pi   outside (-2pi, 0]
+    ======================  ==========  =========
+    Approach TD3_HER_BC     100% / 85%  0% / 0%
+    Place    TD3_HER_BC     100% / 100% 0% / 0%
+    ======================  ==========  =========
+
+    (desired / achieved.)  The training branch is exactly this interval, so
+    applying the rule reproduces the stored vectors rather than approximating
+    them.  Pitch and yaw are left exactly as ``GetRPY`` returned them --
+    SurgicAI does not touch those, and neither do we.
+    """
+    rpy = np.array(rpy, dtype=np.float64, copy=True)
+    roll = rpy[..., 0]
+    roll = np.where(roll <= -2.0 * np.pi, roll + 2.0 * np.pi, roll)
+    roll = np.where(roll > 0.0, roll - 2.0 * np.pi, roll)
+    rpy[..., 0] = roll
+    return rpy
+
+
+def vec7_bound(pose: "Pose") -> np.ndarray:
+    """``pose`` as a raw 7-vector on SurgicAI's roll branch.
+
+    The deployment equivalent of ``Frame2Vec(frame, bound=True)`` with the jaw
+    appended.  Use this to seed a command integrator and to express a goal;
+    never to re-derive a pose mid-episode (see :class:`~.loop.ApproachLoop`).
+    """
+    vec = pose.to_vec7()
+    vec[3:6] = bound_roll(vec[3:6])
+    return vec
+
+
 def unwrap_rpy_to(rpy, reference):
     """Shift ``rpy`` by multiples of 2*pi per channel to sit nearest ``reference``.
 
