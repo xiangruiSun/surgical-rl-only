@@ -10,7 +10,14 @@
 
 numpy>=1.24,<3
 scipy>=1.10
+
+# Only needed for --controller rl / residual. The grasp-and-lift sequence with
+# --controller d2 runs on numpy and scipy alone, so a host that will only ever
+# run the servo can stop at the two lines above.
 stable-baselines3>=2.0,<3
 gymnasium>=0.29
 # CPU torch is enough: the actor is 3x256 MLP, ~1 ms per inference.
 torch>=2.0
+
+# Test suite only (python3 -m pytest tests -q). Not needed on the robot.
+# pytest>=7

@@ -1,5 +1,11 @@
 # SurgicAI Approach — RL deployment on a real dVRK PSM
 
+> **Grasping and lifting now live in [`README_GRASP_LIFT.md`](README_GRASP_LIFT.md)**
+> (`run_grasp_lift.py`): approach → close the jaw → observe → lift 1.5 cm, with
+> a fail-closed precheck and an operator gate. This file still describes the
+> approach-only path (`run_approach.py`), which is unchanged.
+
+
 Runs the released `r6_unified_single_goal_yaw15_seed1_final.zip` checkpoint (or
 the D2 servo, or a blend) as a closed loop against `PSM1/measured_cp`, using
 nothing but a **start pose** (read from the arm) and a **goal position** (given
@@ -179,7 +185,8 @@ absolute block of the 21-dim observation is off-distribution.
 ## Layout
 
 ```
-run_approach.py                 ROS 2 entry point
+run_approach.py                 ROS 2 entry point (approach only)
+run_grasp_lift.py               ROS 2 entry point (approach + grasp + lift)
 requirements-deploy.txt
 surgicai_rl_deploy/
   contract.py                   frozen obs/action contract + measured training support
@@ -189,10 +196,19 @@ surgicai_rl_deploy/
   controllers.py                RL / D2 servo / residual blend
   loop.py                       the closed loop, safety clamps, success test
   ros_node.py                   topics, dry run, JSONL trace
+  sequence.py                   grasp+lift phase machine  (README_GRASP_LIFT.md)
+  jaw.py                        jaw units and grasp evidence          "
+  plan.py                       start / grasp / lifted geometry       "
+  feasibility.py                fail-closed precheck                  "
+  grasp_lift_node.py            grasp+lift ROS node                   "
+  mock.py                       kinematic arm + jaw model             "
 tools/
   inspect_checkpoint.py         what the checkpoint contains and was trained on
   verify_contract.py            observation builder vs the checkpoint's own data
   offline_check.py              replay against a kinematic mock, no robot
+  offline_grasp_lift.py         replay the whole grasp+lift sequence, no robot
+  calibrate_jaw.py              what an empty jaw close looks like on your arm
+tests/                          124 tests; no ROS, no robot, no checkpoint
 ```
 
 ## Contract notes
