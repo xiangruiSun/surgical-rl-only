@@ -438,3 +438,38 @@ def test_a_starved_transport_budget_fails(start_pose, jaw_cal):
     plan = pipeline_plan(start_pose, jaw_cal)
     report = precheck(plan, transport_max_steps=2)
     assert status_of(report, "step_budget_transport") == FAIL
+
+
+# ======================================================================
+# the workspace question, measured rather than argued
+# ======================================================================
+def test_staging_covers_a_whole_needle_envelope():
+    """The claim the workspace tool is built on, pinned as a property.
+
+    A support defined purely by relative geometry can always be satisfied by
+    choosing the start pose, so a needle anywhere in its placement envelope is
+    reachable in-distribution. If this ever fails, the 'extend the workspace'
+    advice in the docs is wrong.
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    from workspace_spec import needle_envelope
+
+    grasp = Pose.from_pos_quat(
+        REAL_GOAL_POS, [0.23320, 0.42679, -0.23589, 0.84133], 0.0
+    )
+    for contract in (APPROACH_UPSTREAM, PLACE_UPSTREAM):
+        for g in needle_envelope(grasp, [3.0, 3.0], 30.0, 60, seed=7):
+            staged = stage_pose_for(g, contract)
+            rep = support_report(staged, g, contract)
+            assert rep["in_support"], (contract.name, rep["reasons"])
+
+
+def test_the_unstaged_real_geometry_is_out_of_support(start_pose, jaw_cal):
+    """...and that it is genuinely out, which is why staging is not optional."""
+    plan = pipeline_plan(start_pose, jaw_cal)
+    rep = support_report(plan.start, plan.grasp, APPROACH_UPSTREAM)
+    assert not rep["in_support"]
+    assert rep["reasons"]
