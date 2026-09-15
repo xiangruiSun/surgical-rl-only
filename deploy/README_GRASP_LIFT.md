@@ -20,7 +20,8 @@ tools/
   calibrate_jaw.py           what an empty close looks like on YOUR arm
   offline_grasp_lift.py      replay the whole sequence with no robot
   plan_r6_start.py           solve a start pose inside the RL policy's support
-tests/                       166 tests, no ROS or robot required
+  sweep_r6_support.py        does the policy work anywhere in that support?
+tests/                       176 tests, no ROS or robot required
 ```
 
 ---
@@ -130,8 +131,21 @@ demonstrations' mean offset leaves more than 1 cm of margin on every axis and
 31° on the rotation, so a millimetre of positioning error cannot push the
 episode back out of support.
 
-**This removes the out-of-distribution excuse. It does not promise the policy
-works.** Run `tools/offline_check.py --controller rl --model ...` on the solved
+`tools/sweep_r6_support.py` answers the question properly, by sampling the box
+rather than trusting one point: it grids the offsets, sweeps the rotation and
+the jaw, verifies every start is in support, and runs both the policy and the
+servo from each so the two are measured on identical geometry.
+
+```bash
+python3 tools/sweep_r6_support.py --model <checkpoint> \
+  --grasp-pos <x y z> --grasp-quat <qx qy qz qw> --grid 3
+```
+
+A zero success rate across the box means the policy does not work inside the
+region it was trained on, and no start-pose engineering will change that.
+
+**Solving for an in-support start removes the out-of-distribution excuse. It
+does not promise the policy works.** Run `tools/offline_check.py --controller rl --model ...` on the solved
 pair before moving anything, and compare against `--controller d2` on the same
 pair. If the policy still will not converge from an in-support start, the
 geometry was never what was wrong with it — and that is a result worth having.
@@ -358,7 +372,7 @@ why the real run makes you state it.
 ## Tests
 
 ```bash
-python3 -m pytest tests -q        # 166 tests, no ROS and no robot
+python3 -m pytest tests -q        # 176 tests, no ROS and no robot
 ```
 
 Covers the jaw mapping and evidence logic, the lift geometry, every precheck

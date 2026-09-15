@@ -208,8 +208,9 @@ tools/
   offline_check.py              replay against a kinematic mock, no robot
   offline_grasp_lift.py         replay the whole grasp+lift sequence, no robot
   plan_r6_start.py              solve a start pose inside the RL policy's support
+  sweep_r6_support.py           does the policy work anywhere in that support?
   calibrate_jaw.py              what an empty jaw close looks like on your arm
-tests/                          166 tests; no ROS, no robot, no checkpoint
+tests/                          176 tests; no ROS, no robot, no checkpoint
 ```
 
 ## Contract notes

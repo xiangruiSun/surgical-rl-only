@@ -61,7 +61,15 @@ def main() -> int:
                     default=None, help="default: hold, or explicit if --goal-quat is given")
     ap.add_argument("--success-trans-cm", type=float, default=1.0)
     ap.add_argument("--success-rot-deg", type=float, default=10.0)
-    ap.add_argument("--start-jaw", type=float, default=0.0, help="normalised 0..1")
+    ap.add_argument("--start-jaw", type=float, default=0.0,
+                    help="normalised 0..1. The R6 demonstrations started at "
+                         "0.76, and the jaw occupies 3 of the 21 observation "
+                         "dimensions, so 0.0 is itself off-distribution.")
+    ap.add_argument("--goal-jaw", default="hold",
+                    help="hold | closed | open | <float>. Training drove the "
+                         "jaw to 0.0 (closed) during the approach; 'hold' "
+                         "leaves it at --start-jaw, which makes the jaw error "
+                         "identically zero.")
     ap.add_argument("--frame-mode", choices=["rebase", "translate", "identity"], default="rebase")
     ap.add_argument("--max-steps", type=int, default=200)
     ap.add_argument("--staged", action="store_true", default=True)
@@ -82,6 +90,7 @@ def main() -> int:
         frame_mode=args.frame_mode,
         goal_orientation=args.goal_orientation or ("explicit" if args.goal_quat else "hold"),
         goal_quat_xyzw=tuple(args.goal_quat) if args.goal_quat else None,
+        goal_jaw=args.goal_jaw,
         max_steps=args.max_steps,
         success_trans_cm=args.success_trans_cm,
         success_rot_rad=float(np.deg2rad(args.success_rot_deg)),
