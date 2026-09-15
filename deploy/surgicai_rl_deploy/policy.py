@@ -14,6 +14,7 @@ hand SB3 ``custom_objects`` overrides for them.  SB3 substitutes those keys
 from __future__ import annotations
 
 import hashlib
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -57,11 +58,34 @@ class ApproachPolicy:
 
     @classmethod
     def load(cls, checkpoint_path, device: str = "cpu", verify: bool = True):
-        from stable_baselines3 import TD3  # imported late: heavy
-
+        # Check the path before importing torch: a typo used to surface as a
+        # ModuleNotFoundError for stable_baselines3, which sends you off
+        # installing two gigabytes to fix a wrong filename.
         path = Path(checkpoint_path).expanduser()
         if not path.is_file():
-            raise FileNotFoundError(f"checkpoint not found: {path}")
+            hint = ""
+            if not path.is_absolute():
+                hint = (
+                    f"\n(resolved against {Path.cwd()}; the checkpoint usually "
+                    "lives in models/rl/ at the repository root, so from "
+                    "deploy/ the path is ../models/rl/...)"
+                )
+            raise FileNotFoundError(f"checkpoint not found: {path}{hint}")
+
+        try:
+            from stable_baselines3 import TD3  # imported late: heavy
+        except ImportError as exc:
+            raise SystemExit(
+                "stable-baselines3 is required for --controller rl/residual but "
+                "is not installed in this interpreter "
+                f"({sys.executable}).\n"
+                "    python3 -m venv --system-site-packages .venv-deploy\n"
+                "    source .venv-deploy/bin/activate\n"
+                "    pip install --index-url https://download.pytorch.org/whl/cpu torch\n"
+                "    pip install 'stable-baselines3>=2.0,<3' 'gymnasium>=0.29'\n"
+                "The CPU wheel is enough: the actor is a 3x256 MLP.\n"
+                "--controller d2 needs none of this."
+            ) from exc
 
         digest = sha256_of(path)
         identity = KNOWN_CHECKPOINTS.get(digest, "UNKNOWN")

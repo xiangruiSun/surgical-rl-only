@@ -209,7 +209,7 @@ tools/
   offline_grasp_lift.py         replay the whole grasp+lift sequence, no robot
   plan_r6_start.py              solve a start pose inside the RL policy's support
   calibrate_jaw.py              what an empty jaw close looks like on your arm
-tests/                          163 tests; no ROS, no robot, no checkpoint
+tests/                          166 tests; no ROS, no robot, no checkpoint
 ```
 
 ## Contract notes
