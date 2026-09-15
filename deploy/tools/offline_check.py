@@ -45,6 +45,19 @@ def build_controller(args):
                               servo_weight=args.servo_weight, staged=args.staged)
 
 
+
+def _step_size_from(args):
+    import numpy as _np
+    from surgicai_rl_deploy.contract import STEP_SIZE_RAW as _S
+    step = _np.asarray(_S, dtype=_np.float64).copy()
+    if getattr(args, "trans_step_mm", None) is not None:
+        step[:3] = args.trans_step_mm / 1000.0
+    if getattr(args, "angle_step_deg", None) is not None:
+        step[3:6] = _np.deg2rad(args.angle_step_deg)
+    if getattr(args, "jaw_step", None) is not None:
+        step[6] = args.jaw_step
+    return step
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -79,6 +92,23 @@ def main() -> int:
                     help="0 = arm reaches the command exactly; 0.3 = 30%% short each step")
     ap.add_argument("--noise-mm", type=float, default=0.0, help="per-step measurement noise")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--trans-step-mm", type=float, default=None,
+                    help="action scale for translation. The package default of "
+                         "1.5 mm is R6's; the upstream SurgicAI Approach "
+                         "checkpoint uses 0.5 mm. Recover it from any "
+                         "checkpoint with tools/recover_step_size.py -- applying "
+                         "a policy's actions at the wrong scale makes it track "
+                         "for a few steps and then diverge.")
+    ap.add_argument("--angle-step-deg", type=float, default=None,
+                    help="action scale for rotation; R6 uses 3 deg, upstream 2")
+    ap.add_argument("--jaw-step", type=float, default=None)
+    ap.add_argument("--goal-rpy-train", nargs=3, type=float, default=None,
+                    metavar=("ROLL", "PITCH", "YAW"),
+                    help="the goal's RPY on the TRAINING 2*pi branch. Defaults "
+                         "to the trained goal's own values in rebase mode.")
+    ap.add_argument("--no-unwrap-rpy", action="store_true",
+                    help="stop unwrapping observations onto the training RPY "
+                         "branch. Only for reproducing the old, broken behaviour.")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--json-out")
     args = ap.parse_args()
@@ -94,6 +124,9 @@ def main() -> int:
         max_steps=args.max_steps,
         success_trans_cm=args.success_trans_cm,
         success_rot_rad=float(np.deg2rad(args.success_rot_deg)),
+        step_size=_step_size_from(args),
+        goal_rpy_train=tuple(args.goal_rpy_train) if args.goal_rpy_train else None,
+        unwrap_rpy=not args.no_unwrap_rpy,
     )
     loop = ApproachLoop(controller, cfg, SafetyLimits())
 

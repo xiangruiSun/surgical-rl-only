@@ -40,6 +40,27 @@ def quat_xyzw_from_rpy(rpy) -> np.ndarray:
     return Rotation.from_euler("xyz", np.asarray(rpy, dtype=np.float64)).as_quat()
 
 
+def unwrap_rpy_to(rpy, reference):
+    """Shift ``rpy`` by multiples of 2*pi per channel to sit nearest ``reference``.
+
+    This is the difference between a rotation and its *coordinates*.  A rotation
+    matrix is branch-invariant, but the RPY triple that describes it is not:
+    scipy's ``as_euler("xyz")`` always returns roll and yaw in [-pi, pi], while
+    the SurgicAI training environments integrate the RPY vector as free state
+    and never re-canonicalize it.  100% of the desired-goal rolls and 85% of the
+    achieved-goal rolls stored in the upstream Approach checkpoint lie outside
+    [-pi, pi], so re-deriving RPY from a matrix silently moves three of the
+    twenty-one observation dimensions onto a branch the policy never saw.
+
+    Unwrapping toward the goal recovers the training branch exactly, provided
+    the per-channel error is under pi -- which it must be for the task to be
+    meaningful at all.
+    """
+    rpy = np.asarray(rpy, dtype=np.float64)
+    reference = np.asarray(reference, dtype=np.float64)
+    return rpy + 2.0 * np.pi * np.round((reference - rpy) / (2.0 * np.pi))
+
+
 def wrap_to_pi(value):
     value = np.asarray(value, dtype=np.float64)
     return (value + np.pi) % (2.0 * np.pi) - np.pi

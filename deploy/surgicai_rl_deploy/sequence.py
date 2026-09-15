@@ -172,6 +172,16 @@ class SequenceConfig:
     #: 'abort' | 'continue' | 'lower'
     on_slip: str = "abort"
 
+    # -- the policy's action contract --------------------------------------
+    #: applied as cmd = measured + action * step_size, raw units.  Recover it
+    #: from a checkpoint with tools/recover_step_size.py rather than trusting
+    #: the default: the upstream Approach checkpoint uses 0.5 mm / 2 deg where
+    #: R6 uses 1.5 mm / 3 deg, and the wrong scale makes a policy diverge.
+    step_size: Optional[np.ndarray] = None
+    #: goal RPY on the training 2*pi branch; None means the trained goal's own
+    goal_rpy_train: Optional[tuple] = None
+    unwrap_rpy: bool = True
+
     # -- evidence thresholds -----------------------------------------------
     residual_margin_deg: float = 1.0
     effort_margin: Optional[float] = None
@@ -252,6 +262,10 @@ class GraspLiftSequencer:
             max_steps=self.cfg.approach_max_steps,
             success_trans_cm=self.cfg.approach_success_trans_cm,
             success_rot_rad=float(np.deg2rad(self.cfg.approach_success_rot_deg)),
+            goal_rpy_train=self.cfg.goal_rpy_train,
+            unwrap_rpy=self.cfg.unwrap_rpy,
+            **({} if self.cfg.step_size is None
+               else {"step_size": np.asarray(self.cfg.step_size, dtype=np.float64)}),
         )
         self._approach_loop = ApproachLoop(self.approach_controller, cfg, self.limits)
         report = self._approach_loop.begin(start.pose, self.plan.grasp.p)
@@ -283,6 +297,7 @@ class GraspLiftSequencer:
             max_steps=max_steps,
             success_trans_cm=success_trans_cm,
             success_rot_rad=float(np.deg2rad(success_rot_deg)),
+            unwrap_rpy=self.cfg.unwrap_rpy,
         )
         loop = ApproachLoop(self.hold_controller, cfg, self.limits)
         loop.begin(measured, goal.p)

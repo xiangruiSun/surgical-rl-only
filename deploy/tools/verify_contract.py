@@ -44,6 +44,33 @@ def _unpickle(blob: str):
     return pickle.loads(base64.b64decode(blob))
 
 
+def check_matrix_round_trip(achieved_scaled, desired_scaled, label, failures):
+    """The check that was missing, and that let a real defect through.
+
+    ``check_pair`` rebuilds observations from the stored 7-vectors, so it never
+    exercises the matrix <-> RPY conversion the live loop performs every cycle.
+    scipy canonicalizes roll and yaw into [-pi, pi]; the SurgicAI environments
+    integrate RPY as free state and store values outside it (100% of the
+    upstream Approach checkpoint's desired-goal rolls). Re-deriving RPY from a
+    matrix therefore lands on a different 2*pi branch and corrupts three of the
+    twenty-one observation dimensions.
+    """
+    from surgicai_rl_deploy.frames import Pose, unwrap_rpy_to
+
+    for name, scaled in (("achieved_goal", achieved_scaled),
+                         ("desired_goal", desired_scaled)):
+        raw = np.asarray(scaled, dtype=np.float64) / GOAL_SCALE
+        round_tripped = Pose.from_vec7(raw).to_vec7()
+        if np.allclose(round_tripped[3:6], raw[3:6], atol=1e-6):
+            continue
+        recovered = unwrap_rpy_to(round_tripped[3:6], raw[3:6])
+        if not np.allclose(recovered, raw[3:6], atol=1e-6):
+            failures.append(
+                (label, f"{name}: RPY survives neither a matrix round-trip nor "
+                        "unwrapping", raw[3:6], round_tripped[3:6])
+            )
+
+
 def check_pair(achieved_scaled, desired_scaled, observation_scaled, label, failures):
     # Our builder takes RAW units, so undo the cm scaling first.
     raw_a = np.asarray(achieved_scaled, dtype=np.float64) / GOAL_SCALE
@@ -93,6 +120,7 @@ def main() -> int:
         idx = np.linspace(0, len(a) - 1, n).astype(int)
         for i in idx:
             check_pair(a[i], d[i], obs[i], f"demo[{i}]", failures)
+            check_matrix_round_trip(a[i], d[i], f"demo[{i}]", failures)
         checked += n
 
     print(f"checked {checked} stored observations")

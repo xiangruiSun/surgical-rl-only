@@ -474,6 +474,19 @@ def resolve_jaw_baseline(spec, *, grip_deg: float, arm: str = "/PSM1"):
     return baseline, None
 
 
+
+def _step_size_from(args):
+    import numpy as _np
+    from surgicai_rl_deploy.contract import STEP_SIZE_RAW as _S
+    step = _np.asarray(_S, dtype=_np.float64).copy()
+    if getattr(args, "trans_step_mm", None) is not None:
+        step[:3] = args.trans_step_mm / 1000.0
+    if getattr(args, "angle_step_deg", None) is not None:
+        step[3:6] = _np.deg2rad(args.angle_step_deg)
+    if getattr(args, "jaw_step", None) is not None:
+        step[6] = args.jaw_step
+    return step
+
 def build_controller(args):
     if args.controller == "d2":
         return D2Controller(staged=True)
@@ -558,6 +571,24 @@ def parse_args(argv=None):
     ap.add_argument("--servo-weight", type=float, default=0.75)
     ap.add_argument("--frame-mode", choices=["rebase", "translate", "identity"],
                     default="rebase")
+    ap.add_argument("--trans-step-mm", type=float, default=None,
+                    help="action scale for translation. The package default of "
+                         "1.5 mm is R6's; the upstream SurgicAI Approach "
+                         "checkpoint uses 0.5 mm. Recover it from any "
+                         "checkpoint with tools/recover_step_size.py -- applying "
+                         "a policy's actions at the wrong scale makes it track "
+                         "for a few steps and then diverge.")
+    ap.add_argument("--angle-step-deg", type=float, default=None,
+                    help="action scale for rotation; R6 uses 3 deg, upstream 2")
+    ap.add_argument("--jaw-step", type=float, default=None)
+    ap.add_argument("--goal-rpy-train", nargs=3, type=float, default=None,
+                    metavar=("ROLL", "PITCH", "YAW"),
+                    help="the goal's RPY on the TRAINING 2*pi branch. Defaults "
+                         "to the trained goal's own values in rebase mode.")
+    ap.add_argument("--no-unwrap-rpy", action="store_true",
+                    help="stop unwrapping observations onto the training RPY "
+                         "branch. Only for reproducing the old, broken behaviour.")
+
 
     # limits
     ap.add_argument("--interface", choices=["servo_cp", "move_cp"], default="servo_cp")
@@ -732,6 +763,9 @@ def main(argv=None) -> int:
         grasp_gate=args.grasp_gate,
         operator_timeout_steps=args.operator_timeout_steps,
         on_slip=args.on_slip,
+        step_size=_step_size_from(args),
+        goal_rpy_train=tuple(args.goal_rpy_train) if args.goal_rpy_train else None,
+        unwrap_rpy=not args.no_unwrap_rpy,
     )
     limits = SafetyLimits(
         workspace_pad_cm=args.workspace_pad_cm,

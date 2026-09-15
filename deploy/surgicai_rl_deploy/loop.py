@@ -40,8 +40,9 @@ from .frames import (
     Pose,
     rotation_error_rad,
     translation_error_cm,
+    unwrap_rpy_to,
 )
-from .obs import observation_from_poses
+from .obs import build_observation
 
 
 @dataclass
@@ -72,6 +73,14 @@ class LoopConfig:
     success_rot_rad: float = SUCCESS_ROT_RAD
     align_rpy_branch: bool = False
     wrap_rpy_delta: bool = False
+    #: RPY of the goal on the *training* branch, in the policy frame.  The
+    #: SurgicAI environments integrate RPY as free state, so training data sits
+    #: on 2*pi branches that a matrix round-trip destroys; observations are
+    #: unwrapped onto this reference before they reach the network.  None in
+    #: 'rebase' mode means "use the trained goal's own RPY", which is right by
+    #: construction.  Set unwrap_rpy=False to restore the old behaviour.
+    goal_rpy_train: Optional[tuple] = None
+    unwrap_rpy: bool = True
     step_size: np.ndarray = field(
         default_factory=lambda: np.asarray(STEP_SIZE_RAW, dtype=np.float64)
     )
@@ -106,6 +115,7 @@ class ApproachLoop:
         self.index = 0
         self._box_low = None
         self._box_high = None
+        self._goal_rpy = None
 
     # ------------------------------------------------------------------
     # setup
@@ -155,6 +165,14 @@ class ApproachLoop:
         if self.cfg.frame_mode == "rebase":
             # Numerically identical to the trained goal; keep the jaw we chose.
             self.goal_policy = self.trained_goal.with_jaw(goal_jaw)
+
+        if self.cfg.goal_rpy_train is not None:
+            self._goal_rpy = np.asarray(self.cfg.goal_rpy_train, dtype=np.float64)
+        elif self.cfg.frame_mode == "rebase":
+            # goal_policy IS the trained goal, so its contract RPY is the branch.
+            self._goal_rpy = np.asarray(R6_TRAINED_GOAL_VEC7[3:6], dtype=np.float64)
+        else:
+            self._goal_rpy = self.goal_policy.to_vec7()[3:6]
 
         lo = np.minimum(start.p, goal_p) - self.limits.workspace_pad_cm / 100.0
         hi = np.maximum(start.p, goal_p) + self.limits.workspace_pad_cm / 100.0
@@ -255,16 +273,21 @@ class ApproachLoop:
                 )
 
         measured_policy = self.bridge.to_policy(measured)
-        obs = observation_from_poses(
-            measured_policy,
-            self.goal_policy,
+
+        cur_vec7 = measured_policy.to_vec7()
+        goal_vec7 = self.goal_policy.to_vec7()
+        if self.cfg.unwrap_rpy:
+            cur_vec7[3:6] = unwrap_rpy_to(cur_vec7[3:6], self._goal_rpy)
+            goal_vec7[3:6] = self._goal_rpy
+        obs = build_observation(
+            cur_vec7,
+            goal_vec7,
             align_rpy_branch=self.cfg.align_rpy_branch,
             wrap_rpy_delta=self.cfg.wrap_rpy_delta,
         )
         action = np.asarray(self.controller.act(obs), dtype=np.float64).reshape(7)
         action = np.clip(action, -1.0, 1.0)
 
-        cur_vec7 = measured_policy.to_vec7()
         cmd_vec7 = cur_vec7 + action * self.cfg.step_size
         if not self.cfg.use_policy_jaw:
             cmd_vec7[6] = measured.jaw

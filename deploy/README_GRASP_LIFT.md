@@ -21,7 +21,8 @@ tools/
   offline_grasp_lift.py      replay the whole sequence with no robot
   plan_r6_start.py           solve a start pose inside the RL policy's support
   sweep_r6_support.py        does the policy work anywhere in that support?
-tests/                       176 tests, no ROS or robot required
+  recover_step_size.py       recover the action scale from a checkpoint's demos
+tests/                       189 tests, no ROS or robot required
 ```
 
 ---
@@ -93,6 +94,65 @@ One `fail` and nothing is published. `--strict` makes every warning fatal.
 The R6 support numbers are still printed under the servo, so you can see what
 the RL path *would* have complained about and compare the two controllers on
 the same real goal.
+
+---
+
+## The RPY branch defect (read this if you use `--controller rl`)
+
+The released checkpoints diverged to ~130° of orientation error on every real
+and simulated start, out of distribution or in. The cause was in this package,
+not in the policies.
+
+A rotation matrix is branch-invariant; the RPY triple describing it is not.
+`scipy`'s `as_euler("xyz")` always returns roll and yaw in ±π, while the
+SurgicAI environments integrate the RPY vector as free state and never
+re-canonicalise it. In the upstream Approach checkpoint **100% of the
+desired-goal rolls and 85% of the achieved-goal rolls lie outside ±π**:
+
+```
+training goal rpy      : [-3.774  0.497  1.317]
+after matrix round-trip: [ 2.509  0.497  1.317]     difference: exactly 2π
+```
+
+Every cycle re-derived RPY from the measured rotation matrix, so three of the
+twenty-one observation dimensions arrived on a branch no policy was trained on.
+Observations are now unwrapped onto the training branch (`unwrap_rpy`, on by
+default; `--no-unwrap-rpy` restores the old behaviour for A/B).
+
+Measured effect, replaying the upstream checkpoint against its own stored
+demonstrations, in the training frame, at the recovered step size:
+
+| | demos reproduced |
+|---|---|
+| canonical RPY (before) | **0 / 20** |
+| unwrapped onto the training branch | **14 / 20**, median 114 steps |
+
+`verify_contract.py` passed throughout because it rebuilds observations from the
+stored 7-vectors and never round-trips a matrix — exactly the gap. It now checks
+the round trip too. The D2 servo was never affected: it uses only *relative*
+rotation, where a common 2π offset cancels.
+
+## The action scale is recoverable, not a matter of belief
+
+`STEP_SIZE_RAW` was read out of the training sources and never verified — the
+contract check covers observations, which never touch it. But the embedded
+demonstrations contain the actions *and* the states they produced, so
+
+```
+achieved[t+1] = achieved[t] + action[t] · step_size
+```
+
+can be solved directly. `tools/recover_step_size.py` does that:
+
+```bash
+python3 tools/recover_step_size.py --model <checkpoint>
+```
+
+On the upstream Approach checkpoint it recovers **0.5 mm / 2° / 0.05** to zero
+residual across 5 928 samples, against the 1.5 mm / 3° this package applied —
+3× the translation and 1.5× the rotation. Run it on any checkpoint before
+trusting `--controller rl`, and pass `--trans-step-mm` / `--angle-step-deg` /
+`--jaw-step` if it disagrees.
 
 ---
 
@@ -372,7 +432,7 @@ why the real run makes you state it.
 ## Tests
 
 ```bash
-python3 -m pytest tests -q        # 176 tests, no ROS and no robot
+python3 -m pytest tests -q        # 189 tests, no ROS and no robot
 ```
 
 Covers the jaw mapping and evidence logic, the lift geometry, every precheck

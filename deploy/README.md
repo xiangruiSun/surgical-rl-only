@@ -209,8 +209,9 @@ tools/
   offline_grasp_lift.py         replay the whole grasp+lift sequence, no robot
   plan_r6_start.py              solve a start pose inside the RL policy's support
   sweep_r6_support.py           does the policy work anywhere in that support?
+  recover_step_size.py          recover the action scale from a checkpoint's demos
   calibrate_jaw.py              what an empty jaw close looks like on your arm
-tests/                          176 tests; no ROS, no robot, no checkpoint
+tests/                          189 tests; no ROS, no robot, no checkpoint
 ```
 
 ## Contract notes
