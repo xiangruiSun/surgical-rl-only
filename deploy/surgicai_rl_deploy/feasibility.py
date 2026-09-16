@@ -228,12 +228,14 @@ def precheck(
             )
         else:
             drop = float(np.dot(plan.suture.p - plan.via.p, -lift_dir) * 100.0)
+            # the descent, split into the part along the lift axis and the part
+            # across it.  Subtracting the parallel component is the whole point;
+            # adding it (as this did until 2026-09-16) doubles a purely vertical
+            # descent and reports the lift distance twice over as "drift".
+            descent = plan.suture.p - plan.via.p
             lateral = float(
-                np.linalg.norm(
-                    (plan.suture.p - plan.via.p) + lift_dir * np.dot(
-                        plan.suture.p - plan.via.p, lift_dir
-                    )
-                ) * 100.0
+                np.linalg.norm(descent - lift_dir * np.dot(descent, lift_dir))
+                * 100.0
             )
             if drop <= 0.0:
                 report.add(

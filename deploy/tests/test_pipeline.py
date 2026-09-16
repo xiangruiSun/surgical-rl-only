@@ -510,3 +510,32 @@ def test_the_unstaged_real_geometry_is_out_of_support(start_pose, jaw_cal):
     rep = support_report(plan.start, plan.grasp, APPROACH_UPSTREAM)
     assert not rep["in_support"]
     assert rep["reasons"]
+
+
+def test_the_descent_is_reported_as_purely_vertical(start_pose, jaw_cal):
+    """The via point is built along the lift axis, so lateral drift is zero.
+
+    This reported 3.000 cm -- exactly twice the lift distance -- until a sign
+    error in the precheck was fixed: it added the component along the lift axis
+    instead of subtracting it, so a perfectly vertical descent was announced as
+    3 cm of sideways drift onto the entry point.
+    """
+    plan = pipeline_plan(start_pose, jaw_cal)
+    check = next(c for c in precheck(plan).checks if c.name == "transport_clearance")
+    assert check.status == PASS
+    assert check.detail["lateral_cm"] == pytest.approx(0.0, abs=1e-9)
+    assert check.detail["drop_cm"] == pytest.approx(
+        plan.lift_spec.distance_m * 100.0, abs=1e-9
+    )
+
+
+def test_a_genuinely_slanted_descent_is_reported(start_pose, jaw_cal):
+    """...and a real one still shows up, so the check is not just zero."""
+    plan = pipeline_plan(start_pose, jaw_cal)
+    slanted = Pose(plan.via.p + np.array([0.004, 0.0, 0.0]), plan.via.R, plan.via.jaw)
+    object.__setattr__(plan, "transport_spec", None)
+    # hand-build the check the same way precheck does, with a displaced via
+    lift_dir = plan.lift_spec.direction(plan.grasp)
+    descent = plan.suture.p - slanted.p
+    lateral = np.linalg.norm(descent - lift_dir * np.dot(descent, lift_dir)) * 100.0
+    assert lateral == pytest.approx(0.4, abs=1e-9)
