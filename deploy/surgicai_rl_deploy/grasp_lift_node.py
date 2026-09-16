@@ -274,6 +274,14 @@ class GraspLiftNode(Node):
             js.position = [float(command.jaw_rad)]
             self.jaw_pub.publish(js)
 
+    def command_subscribers(self) -> dict:
+        """Who, if anyone, is listening to the topics we command on."""
+        return {
+            f"{self.arm}/{self.args.interface}": self.cmd_pub.get_subscription_count(),
+            f"{self.arm}/jaw/{self.args.jaw_interface}":
+                self.jaw_pub.get_subscription_count(),
+        }
+
     def _log(self, record: dict):
         if self.trace_file:
             self.trace_file.write(json.dumps(record, default=str) + "\n")
@@ -587,6 +595,15 @@ def _load_policy(path, device, verify, named_contract=None):
     return policy, contract
 
 
+def _shutdown():
+    """_shutdown() twice raises and buries the real error."""
+    try:
+        if rclpy.ok():
+            rclpy.shutdown()
+    except Exception:
+        pass
+
+
 def build_limits(args) -> SafetyLimits:
     """The safety envelope for a run, including the dry-run exception.
 
@@ -896,7 +913,7 @@ def main(argv=None) -> int:
 
     if "pose" not in holder:
         print(f"no messages on {args.arm}/measured_cp after 5 s", file=sys.stderr)
-        rclpy.shutdown()
+        _shutdown()
         return 2
 
     pos, quat = holder["pose"]
@@ -915,7 +932,7 @@ def main(argv=None) -> int:
         print("--suture-pos needs --suture-quat: the point of the leg is to "
               "present the needle at an angle, so the orientation is the "
               "payload.", file=sys.stderr)
-        rclpy.shutdown()
+        _shutdown()
         return 3
 
     try:
@@ -923,14 +940,14 @@ def main(argv=None) -> int:
         shadow_controller, shadow_contract = build_shadow(args)
     except (SystemExit, FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
-        rclpy.shutdown()
+        _shutdown()
         return 3
 
     if args.stage and contract is None:
         print("--stage needs a checkpoint contract to stage INTO. Pass --model "
               "with --controller rl, or name one with --contract.",
               file=sys.stderr)
-        rclpy.shutdown()
+        _shutdown()
         return 3
 
     standoff = (
@@ -942,7 +959,7 @@ def main(argv=None) -> int:
     if args.taught_grasp_pos is not None:
         if args.taught_grasp_quat is None:
             print("--taught-grasp-pos needs --taught-grasp-quat", file=sys.stderr)
-            rclpy.shutdown()
+            _shutdown()
             return 3
         taught_grasp = Pose.from_pos_quat(
             args.taught_grasp_pos, args.taught_grasp_quat, 0.0
@@ -1003,7 +1020,7 @@ def main(argv=None) -> int:
     print()
     if not report.ok:
         print("refusing to run. Nothing was published.", file=sys.stderr)
-        rclpy.shutdown()
+        _shutdown()
         return 3
 
     cfg = SequenceConfig(
@@ -1055,8 +1072,35 @@ def main(argv=None) -> int:
     if node._measured is None:
         node.get_logger().error("lost measured_cp between the precheck and the run")
         node.destroy_node()
-        rclpy.shutdown()
+        _shutdown()
         return 2
+
+    # Publishing into the void looks exactly like an arm that will not move,
+    # and costs minutes to tell apart by eye. ROS knows the answer immediately.
+    listeners = node.command_subscribers()
+    deaf = [topic for topic, count in listeners.items() if count == 0]
+    if deaf:
+        detail = ", ".join(f"{t} ({listeners[t]} subscribers)" for t in listeners)
+        message = (
+            "nothing is subscribed to " + " and ".join(deaf) + ".\n"
+            f"  {detail}\n"
+            "  Every command would be published and discarded, which looks "
+            "identical to an arm that refuses to move.\n"
+            "  Check: is the PSM enabled and homed (ros2 topic echo "
+            f"{args.arm}/operating_state --once), is the dVRK console running, "
+            f"and is {args.arm} the right arm namespace?"
+        )
+        if args.execute:
+            node.get_logger().error(message)
+            node.destroy_node()
+            _shutdown()
+            return 4
+        node.get_logger().warn("DRY RUN: " + message)
+    else:
+        node.get_logger().info(
+            "command topics have listeners: "
+            + ", ".join(f"{t}={c}" for t, c in listeners.items())
+        )
 
     node.start_episode(report)
     node.create_timer(1.0 / max(args.rate, 0.1), node.tick)
@@ -1065,9 +1109,11 @@ def main(argv=None) -> int:
             rclpy.spin_once(node, timeout_sec=0.1)
     except KeyboardInterrupt:
         node.finish("abort: keyboard interrupt")
+    except Exception as exc:  # including rclpy's ExternalShutdownException
+        node.get_logger().error(f"stopping: {type(exc).__name__}: {exc}")
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        _shutdown()
 
     return 0 if sequencer.reason == "success" else 1
 
