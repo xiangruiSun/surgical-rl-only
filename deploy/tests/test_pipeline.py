@@ -632,3 +632,106 @@ def test_the_approach_contracts_carry_the_seven_millimetres(start_pose, jaw_cal)
     assert APPROACH_UPSTREAM.grasp_standoff_m == pytest.approx(0.007)
     # Place's goal is the entry pose itself, not a standoff from it
     assert PLACE_UPSTREAM.grasp_standoff_m == pytest.approx(0.0)
+
+
+# ======================================================================
+# compensating a hand-taught suturing pose
+# ======================================================================
+def test_the_compensation_identity(start_pose, jaw_cal):
+    """S_a = S_t G_t^-1 G_a puts the needle in the same place, whatever it is.
+
+    Verified against a needle pose and an entry pose that the formula never
+    sees -- which is the whole point: both cancel.
+    """
+    from scipy.spatial.transform import Rotation
+
+    rng = np.random.default_rng(11)
+    plan = pipeline_plan(start_pose, jaw_cal)
+    for _ in range(50):
+        needle = Pose(rng.normal(size=3),
+                      Rotation.random(random_state=int(rng.integers(1e6))).as_matrix())
+        entry = Pose(rng.normal(size=3),
+                     Rotation.random(random_state=int(rng.integers(1e6))).as_matrix())
+        taught_grasp = Pose(rng.normal(size=3),
+                            Rotation.random(random_state=int(rng.integers(1e6))).as_matrix())
+        actual_grasp = Pose(rng.normal(size=3),
+                            Rotation.random(random_state=int(rng.integers(1e6))).as_matrix())
+
+        taught_suture = entry * needle.inverse() * taught_grasp
+        p = build_plan(
+            plan.start, plan.grasp.p, goal_orientation="explicit",
+            goal_quat_xyzw=tuple(plan.grasp.quat_xyzw()),
+            lift=plan.lift_spec, jaw=jaw_cal,
+            suture_position_m=taught_suture.p,
+            suture_quat_xyzw=tuple(taught_suture.quat_xyzw()),
+            taught_grasp_pose=taught_grasp,
+        )
+        want = entry * needle.inverse() * actual_grasp
+        got = p.compensated_suture(actual_grasp)
+        np.testing.assert_allclose(got.p, want.p, atol=1e-9)
+        assert rotation_error_rad(got, want) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_compensation_is_identity_when_the_grasp_lands_where_it_was_taught(
+    start_pose, jaw_cal
+):
+    p = pipeline_plan(start_pose, jaw_cal)
+    same = p.compensated_suture(p.grasp)
+    np.testing.assert_allclose(same.p, p.suture.p, atol=1e-12)
+    assert rotation_error_rad(same, p.suture) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_a_shifted_grasp_shifts_the_suturing_pose_the_same_way(start_pose, jaw_cal):
+    p = pipeline_plan(start_pose, jaw_cal)
+    shifted = Pose(p.grasp.p + np.array([0.002, 0.0, 0.0]), p.grasp.R, p.grasp.jaw)
+    out = p.compensated_suture(shifted)
+    # a pure translation of the grasp, expressed in the grasp frame, arrives as
+    # the same translation expressed in the suturing frame
+    local = p.grasp.R.T @ np.array([0.002, 0.0, 0.0])
+    np.testing.assert_allclose(out.p - p.suture.p, p.suture.R @ local, atol=1e-12)
+
+
+def test_the_run_records_and_applies_the_compensation(start_pose, jaw_cal, baseline):
+    plan = pipeline_plan(start_pose, jaw_cal)
+    seq, steps = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0), lag=0.4)
+    assert seq.phase == PHASE_DONE, seq.reason
+    record = seq.summary()["suture_compensation"]
+    assert record is not None and record["mode"] == "apply"
+    # the arm ends at the CORRECTED pose, which is where the needle belongs
+    final = steps[-1].measured.pose
+    assert np.linalg.norm(final.p - seq.suture_target.p) * 100.0 < 0.3
+
+
+def test_report_mode_measures_without_moving_the_target(start_pose, jaw_cal,
+                                                        baseline):
+    plan = pipeline_plan(start_pose, jaw_cal)
+    cfg = SequenceConfig(grasp_gate="always", compensate_suture="report")
+    seq, _ = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0), lag=0.4, cfg=cfg)
+    assert seq.summary()["suture_compensation"]["mode"] == "report"
+    np.testing.assert_allclose(seq.suture_target.p, plan.suture.p, atol=1e-12)
+
+
+def test_an_implausible_compensation_stops_the_run(start_pose, jaw_cal, baseline):
+    """A big correction means the needle probably moved, which this cannot model."""
+    plan = pipeline_plan(start_pose, jaw_cal)
+    # pretend the suturing pose was taught with a grasp 5 cm away
+    plan.taught_grasp = Pose(plan.grasp.p + np.array([0.05, 0.0, 0.0]),
+                             plan.grasp.R, plan.grasp.jaw)
+    cfg = SequenceConfig(grasp_gate="always", max_suture_compensation_mm=10.0)
+    seq, steps = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0), cfg=cfg)
+    assert seq.phase == PHASE_ABORTED
+    assert "from where the suturing pose was taught" in seq.reason
+    assert PHASE_PLACE not in [s.phase for s in steps]
+
+
+def test_compensation_can_be_switched_off(start_pose, jaw_cal, baseline):
+    plan = pipeline_plan(start_pose, jaw_cal)
+    cfg = SequenceConfig(grasp_gate="always", compensate_suture="off")
+    seq, _ = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0), lag=0.4, cfg=cfg)
+    assert seq.summary()["suture_compensation"] is None
+    np.testing.assert_allclose(seq.suture_target.p, plan.suture.p, atol=1e-12)
+
+
+def test_an_unknown_compensation_mode_is_refused():
+    with pytest.raises(ValueError, match="compensate_suture"):
+        SequenceConfig(compensate_suture="sometimes")

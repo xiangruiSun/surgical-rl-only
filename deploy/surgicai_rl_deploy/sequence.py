@@ -189,6 +189,17 @@ class SequenceConfig:
     #: trained with, all of which differ per checkpoint.
     approach_contract: object = None
 
+    # -- suturing-pose compensation ----------------------------------------
+    #: 'apply' | 'report' | 'off'.  A hand-taught suturing pose encodes how the
+    #: needle sat in the jaws when it was recorded; if the jaws close somewhere
+    #: else, the placement is wrong by that difference, and the correction is
+    #: exact (see GraspLiftPlan.compensated_suture).
+    compensate_suture: str = "apply"
+    #: a correction larger than this means something happened that the
+    #: compensation cannot model -- most likely the needle moved -- so the run
+    #: stops rather than confidently placing it somewhere new
+    max_suture_compensation_mm: float = 10.0
+
     # -- transport and place ------------------------------------------------
     transport_max_steps: int = 600
     transport_success_trans_cm: float = 0.3
@@ -261,6 +272,10 @@ class SequenceConfig:
             raise ValueError(f"unknown grasp gate {self.grasp_gate!r}")
         if self.on_slip not in ("abort", "continue", "lower"):
             raise ValueError(f"unknown on_slip policy {self.on_slip!r}")
+        if self.compensate_suture not in ("apply", "report", "off"):
+            raise ValueError(
+                f"unknown compensate_suture {self.compensate_suture!r}"
+            )
         if self.on_approach_failure not in ("hold", "servo"):
             raise ValueError(
                 f"unknown on_approach_failure {self.on_approach_failure!r}"
@@ -299,6 +314,8 @@ class GraspLiftSequencer:
         self._shadow_loop: Optional[ApproachLoop] = None
         self.shadow_log: list = []
         self.shadow_support: Optional[dict] = None
+        #: the suturing pose actually aimed at, after compensation
+        self.suture_target: Optional[Pose] = plan.suture
         self.limits = limits or SafetyLimits()
         self.baseline = jaw_baseline
         self.confirm_callback = confirm_callback
@@ -473,9 +490,53 @@ class GraspLiftSequencer:
         })
         self._enter(PHASE_DESCEND, "closing the standoff onto the needle")
 
+    def _resolve_suture(self, events: list):
+        """Correct the taught suturing pose for where the jaws actually closed."""
+        self.suture_target = self.plan.suture
+        if self.grasp_pose_measured is None or self.cfg.compensate_suture == "off":
+            return True
+
+        corrected = self.plan.compensated_suture(self.grasp_pose_measured)
+        shift_mm = float(np.linalg.norm(corrected.p - self.plan.suture.p) * 1000.0)
+        turn_deg = float(np.degrees(rotation_error_rad(corrected, self.plan.suture)))
+        record = {
+            "i": self.index,
+            "event": "suture_compensation",
+            "mode": self.cfg.compensate_suture,
+            "shift_mm": shift_mm,
+            "turn_deg": turn_deg,
+            "taught_grasp_cm": (
+                (self.plan.taught_grasp or self.plan.grasp).p * 100.0
+            ).tolist(),
+            "measured_grasp_cm": (self.grasp_pose_measured.p * 100.0).tolist(),
+            "note": (
+                "the suturing pose was taught with one grasp; the jaws closed at "
+                "another, so the needle sits differently in them. This corrects "
+                "for that exactly, ASSUMING the needle itself did not move."
+            ),
+        }
+        events.append(record)
+
+        if shift_mm > self.cfg.max_suture_compensation_mm:
+            self._finish(
+                PHASE_ABORTED,
+                f"the grasp landed {shift_mm:.1f} mm from where the suturing "
+                f"pose was taught, past the {self.cfg.max_suture_compensation_mm:.1f} "
+                "mm limit. Either the arm missed badly or the needle moved; "
+                "either way the taught suturing pose no longer describes where "
+                "this needle has to go.",
+            )
+            return False
+
+        if self.cfg.compensate_suture == "apply":
+            self.suture_target = corrected
+        return True
+
     def _begin_transport(self, measured: Pose, events: list):
         """Leave the lift pose for the suturing point, with the needle held."""
-        target = self.plan.via or self.plan.suture
+        if not self._resolve_suture(events):
+            return
+        target = self.plan.via_for(self.suture_target) or self.suture_target
         self._start_segment(
             measured, target,
             max_steps=self.cfg.transport_max_steps,
@@ -485,7 +546,8 @@ class GraspLiftSequencer:
         self._start_shadow(measured, events)
         events.append({
             "i": self.index, "event": "transport_begin",
-            "target": "via" if self.plan.via is not None else "suture",
+            "target": ("via" if self.plan.via_for(self.suture_target) is not None
+                       else "suture"),
             "travel_cm": float(np.linalg.norm(target.p - measured.p) * 100.0),
             "rotation_deg": float(
                 np.degrees(rotation_error_rad(Pose(measured.p, measured.R, 0.0), target))
@@ -503,8 +565,8 @@ class GraspLiftSequencer:
         cfg = LoopConfig(
             frame_mode=self.cfg.frame_mode,
             goal_orientation="explicit",
-            goal_quat_xyzw=tuple(self.plan.suture.quat_xyzw()),
-            goal_jaw=str(self.plan.suture.jaw),
+            goal_quat_xyzw=tuple(self.suture_target.quat_xyzw()),
+            goal_jaw=str(self.suture_target.jaw),
             use_policy_jaw=False,
             max_steps=self.cfg.transport_max_steps + self.cfg.place_max_steps,
             success_trans_cm=(
@@ -530,7 +592,7 @@ class GraspLiftSequencer:
         try:
             loop = ApproachLoop(self.shadow_controller, cfg, self.limits,
                                 contract=contract)
-            report = loop.begin(measured, self.plan.suture.p)
+            report = loop.begin(measured, self.suture_target.p)
         except Exception as exc:  # a shadow must never take down the real run
             events.append({"i": self.index, "event": "shadow_unavailable",
                            "error": f"{type(exc).__name__}: {exc}"})
@@ -963,7 +1025,7 @@ class GraspLiftSequencer:
                 events.append({"i": self.index, "event": "transport_reached",
                                "trans_err_cm": trans_err, "rot_err_deg": rot_err})
                 self._start_segment(
-                    measured.pose, self.plan.suture,
+                    measured.pose, self.suture_target,
                     max_steps=self.cfg.place_max_steps,
                     success_trans_cm=self.cfg.place_success_trans_cm,
                     success_rot_deg=self.cfg.place_success_rot_deg,
@@ -1135,6 +1197,10 @@ class GraspLiftSequencer:
             "phase": self.phase,
             "reason": self.reason,
             "steps": self.index,
+            "suture_compensation": next(
+                (e for e in self.events
+                 if e.get("event") == "suture_compensation"), None
+            ),
             "reached_suture_pose": bool(
                 self.plan.suture is not None
                 and any(e.get("event") == "suture_pose_reached" for e in self.events)

@@ -338,6 +338,58 @@ that may be holding a needle above the tissue does not get opened
 automatically. Take manual control. The cycle that ends a run issues no fresh
 command at all — the arm keeps tracking the pose it was already given.
 
+## The policy stops 7 mm short of the needle
+
+`scene_manager.needle_goal_evaluator` builds the Approach goal as
+
+```
+needle_pose(grasp_angle) · translate(0, 0, lift_height=7 mm) · R_fixed
+```
+
+`R_fixed` flips the tool z axis, so the goal is the grasp point **backed off
+7 mm along the gripper's own approach axis**, jaws pointing at it. The trained
+policy never drives into the needle.
+
+In simulation the grasp is then faked — `actuators[0].actuate("Needle")`
+attaches the needle wherever the jaws are — so nothing in training ever had to
+travel that last 7 mm. On hardware something must, and closing the jaw at the
+policy's goal would close it 7 mm above the needle and hold nothing.
+
+Hence the `descend` phase: after the policy arrives at the hover pose, a
+separate segment closes the standoff at **0.5 mm per cycle**, straight down the
+jaw axis, orientation frozen. It is the one motion in the run that can move the
+needle before it is held, which is why it is the slowest. `--grasp-standoff-mm`
+overrides; the default comes from the checkpoint contract.
+
+Staging solves against the hover pose, not the grasp pose, because that is what
+the training support is relative to.
+
+## A hand-taught suturing pose is only valid for the grasp it was taught with
+
+If you record the suturing pose by jogging the arm with a needle held, that
+pose silently encodes **how the needle sat in the jaws at that moment**. Close
+the jaws somewhere else next time and the needle sits differently, so the
+placement is wrong by the same difference.
+
+The correction is exact and needs neither the needle pose nor the entry pose.
+With `W` the needle's pose in the world, `E` where the needle must end up, and
+`N = G⁻¹W` how it sits in the jaws, a tool pose `S` puts the needle at `S·N`,
+so reaching `E` needs `S = E·W⁻¹·G`. Taught with `G_t` and grasping at `G_a`:
+
+```
+S_a = S_t · G_t⁻¹ · G_a
+```
+
+Both `E` and `W` cancel. `--compensate-suture apply` (the default) does this
+after the jaws close, using the *measured* grasp pose; `report` measures it
+without moving the target; `off` disables it. A correction larger than
+`--max-suture-compensation-mm` (default 10 mm) aborts, because at that size the
+likeliest explanation is that the needle moved, and nothing short of perception
+can model that.
+
+`--taught-grasp-pos/--taught-grasp-quat` name the grasp the suturing pose was
+taught with, when it differs from the one being run.
+
 ## The shadow controller
 
 `--shadow-model <checkpoint>` runs a second policy alongside the transport and

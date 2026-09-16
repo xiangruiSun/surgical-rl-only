@@ -149,6 +149,17 @@ def parse_args(argv=None):
                          "angle, expressed as a gripper pose")
     ap.add_argument("--suture-confirmed", action="store_true",
                     help="a human has checked this pose against the scene")
+    ap.add_argument("--taught-grasp-pos", nargs=3, type=float, default=None,
+                    help="the grasp pose the SUTURING pose was taught with, if "
+                         "different from --grasp-pos. The suturing pose encodes "
+                         "how the needle sat in the jaws at that moment.")
+    ap.add_argument("--taught-grasp-quat", nargs=4, type=float, default=None)
+    ap.add_argument("--compensate-suture", choices=["apply", "report", "off"],
+                    default="apply",
+                    help="correct the suturing pose for where the jaws actually "
+                         "closed. Exact, and needs neither the needle pose nor "
+                         "the entry pose; assumes the needle did not move.")
+    ap.add_argument("--max-suture-compensation-mm", type=float, default=10.0)
     ap.add_argument("--transport-via", choices=["lift_height", "direct"],
                     default="lift_height")
     ap.add_argument("--transport-clearance-cm", type=float, default=None,
@@ -280,6 +291,14 @@ def main(argv=None) -> int:
             "with --controller rl, or name one with --contract."
         )
 
+    taught_grasp = None
+    if args.taught_grasp_pos is not None:
+        if args.taught_grasp_quat is None:
+            raise SystemExit("--taught-grasp-pos needs --taught-grasp-quat")
+        taught_grasp = Pose.from_pos_quat(
+            args.taught_grasp_pos, args.taught_grasp_quat, 0.0
+        )
+
     transport = None
     if args.suture_pos is not None:
         transport = TransportSpec(
@@ -302,6 +321,7 @@ def main(argv=None) -> int:
         suture_position_m=args.suture_pos,
         suture_quat_xyzw=tuple(args.suture_quat) if args.suture_quat else None,
         transport=transport,
+        taught_grasp_pose=taught_grasp,
         stage_contract=contract if args.stage else None,
         stage_offset_tool_cm=args.stage_offset_tool_cm,
         stage_rotation_deg=args.stage_rotation_deg,

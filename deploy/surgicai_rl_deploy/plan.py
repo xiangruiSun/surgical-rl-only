@@ -159,6 +159,14 @@ class GraspLiftPlan:
     grasp_standoff_m: float = 0.0
     #: final tool pose at the suturing point, with the needle angled
     suture: Optional[Pose] = None
+    #: the grasp pose the suturing pose was taught with.
+    #:
+    #: A hand-taught suturing pose silently encodes how the needle sat in the
+    #: jaws at the moment it was recorded.  If the arm later closes somewhere
+    #: else, the needle sits differently and the placement is wrong by that
+    #: difference.  Keeping the taught grasp makes the discrepancy computable:
+    #: see :meth:`compensated_suture`.
+    taught_grasp: Optional[Pose] = None
     transport_spec: Optional[TransportSpec] = None
 
     @property
@@ -181,12 +189,39 @@ class GraspLiftPlan:
         """The pose the approach leg is asked to reach."""
         return self.hover or self.grasp
 
+    def compensated_suture(self, measured_grasp: Pose) -> Pose:
+        """The suturing pose corrected for where the jaws actually closed.
+
+        Let ``W`` be the needle's pose in the world at grasp time, ``E`` where
+        the needle must end up, and ``N = G^-1 W`` how it sits in the jaws.
+        A tool pose ``S`` puts the needle at ``S N``, so reaching ``E`` needs
+        ``S = E N^-1 = E W^-1 G``.  Taught with grasp ``G_t`` that gives
+        ``S_t = E W^-1 G_t``; grasping instead at ``G_a`` needs
+        ``S_a = E W^-1 G_a``.  Therefore
+
+            S_a = S_t * G_t^-1 * G_a
+
+        and both ``E`` and ``W`` cancel -- neither the entry pose nor the
+        needle pose has to be known.  The one assumption is that the needle did
+        not move in the world between the taught grasp and this one; if it did,
+        nothing short of perception can help, and the size of the correction is
+        at least a hint that something is wrong.
+        """
+        if self.suture is None:
+            raise ValueError("this plan has no suturing pose")
+        taught = self.taught_grasp or self.grasp
+        delta = taught.inverse() * measured_grasp
+        return (self.suture * delta).with_jaw(self.suture.jaw)
+
+    def via_for(self, suture: Pose) -> Optional[Pose]:
+        spec = self.transport_spec or TransportSpec()
+        return spec.via_pose(suture, self.lift_spec, self.grasp)
+
     @property
     def via(self) -> Optional[Pose]:
         if self.suture is None:
             return None
-        spec = self.transport_spec or TransportSpec()
-        return spec.via_pose(self.suture, self.lift_spec, self.grasp)
+        return self.via_for(self.suture)
 
     @property
     def waypoints(self) -> list:
@@ -332,6 +367,7 @@ def build_plan(
     suture_position_m=None,
     suture_quat_xyzw: Optional[tuple] = None,
     transport: Optional[TransportSpec] = None,
+    taught_grasp_pose: Optional[Pose] = None,
     stage_contract=None,
     stage_offset_tool_cm=None,
     stage_rotation_deg: Optional[float] = None,
@@ -407,5 +443,6 @@ def build_plan(
     return GraspLiftPlan(
         start=start, grasp=grasp_pose, lifted=lifted_pose, lift_spec=lift, jaw=jaw,
         staged=staged_pose, grasp_standoff_m=float(grasp_standoff_m),
-        suture=suture_pose, transport_spec=transport,
+        suture=suture_pose, taught_grasp=taught_grasp_pose,
+        transport_spec=transport,
     )

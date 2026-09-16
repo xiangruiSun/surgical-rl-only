@@ -620,6 +620,17 @@ def parse_args(argv=None):
     ap.add_argument("--suture-confirmed", action="store_true",
                     help="required for --execute: a human has checked this pose "
                          "against the scene")
+    ap.add_argument("--taught-grasp-pos", nargs=3, type=float, default=None,
+                    help="the grasp pose the SUTURING pose was taught with, if "
+                         "different from --grasp-pos. The suturing pose encodes "
+                         "how the needle sat in the jaws at that moment.")
+    ap.add_argument("--taught-grasp-quat", nargs=4, type=float, default=None)
+    ap.add_argument("--compensate-suture", choices=["apply", "report", "off"],
+                    default="apply",
+                    help="correct the suturing pose for where the jaws actually "
+                         "closed. Exact, and needs neither the needle pose nor "
+                         "the entry pose; assumes the needle did not move.")
+    ap.add_argument("--max-suture-compensation-mm", type=float, default=10.0)
     ap.add_argument("--transport-via", choices=["lift_height", "direct"],
                     default="lift_height")
     ap.add_argument("--transport-clearance-cm", type=float, default=None)
@@ -874,6 +885,16 @@ def main(argv=None) -> int:
         else (contract.grasp_standoff_m if contract is not None else 0.0)
     )
 
+    taught_grasp = None
+    if args.taught_grasp_pos is not None:
+        if args.taught_grasp_quat is None:
+            print("--taught-grasp-pos needs --taught-grasp-quat", file=sys.stderr)
+            rclpy.shutdown()
+            return 3
+        taught_grasp = Pose.from_pos_quat(
+            args.taught_grasp_pos, args.taught_grasp_quat, 0.0
+        )
+
     transport = None
     if args.suture_pos is not None:
         transport = TransportSpec(
@@ -896,6 +917,7 @@ def main(argv=None) -> int:
         suture_position_m=args.suture_pos,
         suture_quat_xyzw=tuple(args.suture_quat) if args.suture_quat else None,
         transport=transport,
+        taught_grasp_pose=taught_grasp,
         stage_contract=contract if args.stage else None,
         stage_offset_tool_cm=args.stage_offset_tool_cm,
         stage_rotation_deg=args.stage_rotation_deg,
@@ -916,6 +938,8 @@ def main(argv=None) -> int:
         lift_max_steps=args.lift_max_steps,
         descend_max_steps=args.descend_max_steps,
         descend_step_mm=args.descend_step_mm,
+        compensate_suture=args.compensate_suture,
+        max_suture_compensation_mm=args.max_suture_compensation_mm,
         transport_max_steps=args.transport_max_steps,
         place_max_steps=args.place_max_steps,
         success_trans_cm=args.lift_success_trans_cm,
