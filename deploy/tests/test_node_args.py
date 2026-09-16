@@ -288,3 +288,67 @@ class _FakeReport:
 
     def as_dict(self):
         return {"ok": True, "strict": False, "checks": []}
+
+
+# ----------------------------------------------------------------------
+# the operator gate has to be visible
+# ----------------------------------------------------------------------
+def test_the_gate_prompt_is_reprinted(node_module, plan, baseline):
+    """It used to print once and then scroll away under a 10 Hz status line."""
+    import time as _time
+
+    node, sequencer = _build_node(
+        node_module, plan, baseline,
+        ["--grasp-pos", "0", "0", "0", "--lift-sign", "-1",
+         "--confirm-reprompt-s", "0", "--dry-run-confirm-after-s", "0"],
+    )
+    node._measured_stamp = _time.monotonic()
+    sequencer.begin(node._state())
+    for _ in range(3):
+        node._confirm_callback()
+    prompts = [m for lvl, m in node.get_logger().lines if "waiting for you" in m]
+    assert len(prompts) == 3, "the prompt must repeat while it waits"
+
+
+def test_a_dry_run_releases_the_gate_so_the_walkthrough_finishes(
+    node_module, plan, baseline
+):
+    node, sequencer = _build_node(
+        node_module, plan, baseline,
+        ["--grasp-pos", "0", "0", "0", "--lift-sign", "-1",
+         "--dry-run-confirm-after-s", "0.0001"],
+    )
+    sequencer.begin(node._state())
+    assert node._confirm_callback() is None  # first call only prompts
+    import time as _time
+
+    _time.sleep(0.01)
+    assert node._confirm_callback() is True
+    assert any("DRY RUN: nobody answered" in m for _, m in node.get_logger().lines)
+
+
+def test_a_live_run_never_releases_the_gate_by_itself(node_module, plan, baseline):
+    node, sequencer = _build_node(
+        node_module, plan, baseline,
+        ["--grasp-pos", "0", "0", "0", "--lift-sign", "-1", "--execute",
+         "--dry-run-confirm-after-s", "0.0001"],
+    )
+    sequencer.begin(node._state())
+    import time as _time
+
+    for _ in range(5):
+        _time.sleep(0.005)
+        assert node._confirm_callback() is None, "a live gate must wait for a person"
+
+
+def test_the_gate_still_answers_the_topic(node_module, plan, baseline):
+    node, sequencer = _build_node(
+        node_module, plan, baseline,
+        ["--grasp-pos", "0", "0", "0", "--lift-sign", "-1", "--execute"],
+    )
+    sequencer.begin(node._state())
+    node._confirm_callback()
+    node._confirm = True
+    assert node._confirm_callback() is True
+    node._confirm = False
+    assert node._confirm_callback() is False

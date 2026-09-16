@@ -61,6 +61,9 @@ from .sequence import (
     GraspLiftSequencer,
     SequenceConfig,
     PHASE_DONE,
+    PHASE_HOLD,
+    PHASE_OBSERVE,
+    PHASE_WAIT_OPERATOR,
 )
 
 
@@ -97,6 +100,10 @@ class GraspLiftNode(Node):
         self._jaw_stamp = 0.0
         self._confirm: Optional[bool] = None
         self._confirm_prompted = False
+        self._confirm_prompted_at = 0.0
+        self._confirm_first_at = time.monotonic()
+        self._last_logged_phase = None
+        self._last_logged_at = 0.0
 
         self.create_subscription(
             PoseStamped, f"{self.arm}/measured_cp", self._on_measured_cp, qos
@@ -177,9 +184,23 @@ class GraspLiftNode(Node):
         )
 
     def _confirm_callback(self) -> Optional[bool]:
-        """Operator says go / no.  Topic first, then the keyboard."""
+        """Operator says go / no.  Topic first, then the keyboard.
+
+        The prompt is re-printed periodically.  It used to be printed once and
+        then buried under a 10 Hz status line, so within seconds the only thing
+        on screen was a stationary arm repeating itself and no hint that it was
+        waiting for a person.
+        """
+        now = time.monotonic()
+        due = (
+            not self._confirm_prompted
+            or now - self._confirm_prompted_at >= self.args.confirm_reprompt_s
+        )
         if not self._confirm_prompted:
+            self._confirm_first_at = now
+        if due:
             self._confirm_prompted = True
+            self._confirm_prompted_at = now
             summary = self.sequencer.window.summary()
             self.get_logger().warn("=" * 68)
             self.get_logger().warn("JAW IS CLOSED. The lift is waiting for you.")
@@ -206,6 +227,19 @@ class GraspLiftNode(Node):
         if self._confirm is not None:
             answer, self._confirm = self._confirm, None
             return answer
+
+        # A dry run publishes nothing, so blocking forever on a human defeats
+        # the point of walking the sequence.  Answer it, loudly, and say that a
+        # live run would not.
+        if not self.args.execute and self.args.dry_run_confirm_after_s > 0.0:
+            waited = now - self._confirm_first_at
+            if waited >= self.args.dry_run_confirm_after_s:
+                self.get_logger().warn(
+                    f"DRY RUN: nobody answered in {waited:.0f} s, so the gate is "
+                    "being released automatically to show the rest of the "
+                    "sequence. A live run waits indefinitely."
+                )
+                return True
 
         if sys.stdin is not None and sys.stdin.isatty():
             ready, _, _ = select.select([sys.stdin], [], [], 0)
@@ -400,7 +434,9 @@ class GraspLiftNode(Node):
                 f"meas {np.degrees(jaw.measured_rad):+6.1f} "
                 f"blocked={jaw.jaw_blocked}"
             )
-        self.get_logger().info(
+        # Waiting for a human is not news every 100 ms.  Anything that moves,
+        # changes phase, clamps or raises an event still prints immediately.
+        line = (
             f"{step.index:4d} {step.phase:<14s} err {step.trans_err_cm:6.2f} cm / "
             f"{step.rot_err_deg:6.2f} deg{jaw_txt}"
             + (
@@ -409,6 +445,16 @@ class GraspLiftNode(Node):
                 else ""
             )
         )
+        quiet = (
+            step.phase == self._last_logged_phase
+            and not step.events
+            and not step.clamps
+            and step.phase in (PHASE_WAIT_OPERATOR, PHASE_HOLD, PHASE_OBSERVE)
+        )
+        if not quiet or (time.monotonic() - self._last_logged_at) >= 2.0:
+            self.get_logger().info(line)
+            self._last_logged_at = time.monotonic()
+        self._last_logged_phase = step.phase
         for event in step.events:
             self.get_logger().warn(f"  * {json.dumps(event, default=str)}")
         self._log({"event": "step", **step.as_dict()})
@@ -620,6 +666,13 @@ def parse_args(argv=None):
     ap.add_argument("--suture-confirmed", action="store_true",
                     help="required for --execute: a human has checked this pose "
                          "against the scene")
+    ap.add_argument("--confirm-reprompt-s", type=float, default=10.0,
+                    help="re-print the operator prompt this often while "
+                         "waiting, so it cannot scroll away")
+    ap.add_argument("--dry-run-confirm-after-s", type=float, default=15.0,
+                    help="in a DRY RUN only, release the operator gate after "
+                         "this long so the rest of the sequence can be walked. "
+                         "0 waits forever. A live run always waits.")
     ap.add_argument("--taught-grasp-pos", nargs=3, type=float, default=None,
                     help="the grasp pose the SUTURING pose was taught with, if "
                          "different from --grasp-pos. The suturing pose encodes "
