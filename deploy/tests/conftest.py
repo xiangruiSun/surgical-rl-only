@@ -98,8 +98,14 @@ def node_module():
             node = self
 
             class _Pub:
+                #: tests can set this to rehearse "nobody is listening"
+                subscription_count = 1
+
                 def publish(self, msg):
                     node.published.append(msg)
+
+                def get_subscription_count(self):
+                    return self.subscription_count
 
             return _Pub()
 

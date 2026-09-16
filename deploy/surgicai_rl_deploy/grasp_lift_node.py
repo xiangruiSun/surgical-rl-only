@@ -815,6 +815,17 @@ def parse_args(argv=None):
     # limits
     ap.add_argument("--interface", choices=["servo_cp", "move_cp"], default="servo_cp")
     ap.add_argument("--rate", type=float, default=10.0)
+    ap.add_argument("--discovery-timeout-s", type=float, default=5.0,
+                    help="how long to wait for a subscriber to appear on the "
+                         "command topics before deciding nobody is listening. "
+                         "DDS matching is not instant, and anything published "
+                         "before it completes is silently dropped.")
+    ap.add_argument("--min-servo-rate", type=float, default=8.0,
+                    help="refuse to --execute on servo_cp below this rate. "
+                         "servo_cp is a STREAM with a watchdog: setpoints "
+                         "arriving too far apart are treated as stale and "
+                         "discarded, and the arm silently does not move. "
+                         "0 disables the check.")
     ap.add_argument("--approach-max-steps", type=int, default=200)
     ap.add_argument("--lift-max-steps", type=int, default=120)
     ap.add_argument("--success-trans-cm", type=float, default=1.0)
@@ -1100,8 +1111,53 @@ def main(argv=None) -> int:
         _shutdown()
         return 2
 
+    # servo_cp is a stream, not a sequence of goals. Too slow and every
+    # setpoint is stale on arrival: the commands are accepted, discarded, and
+    # the arm sits still -- which looks exactly like a controller that is not
+    # commanding anything. move_cp is the opposite: it plans a trajectory per
+    # message, so streaming it preempts each motion before it gets going.
+    if args.interface == "servo_cp" and args.min_servo_rate > 0.0:
+        if args.rate < args.min_servo_rate:
+            message = (
+                f"--rate {args.rate:g} Hz is too slow for servo_cp, which is a "
+                f"streamed setpoint with a watchdog; below about "
+                f"{args.min_servo_rate:g} Hz the arm discards the setpoints as "
+                "stale and does not move. Raise --rate, or lower "
+                "--min-servo-rate if you know this arm tolerates it."
+            )
+            if args.execute:
+                node.get_logger().error(message)
+                node.destroy_node()
+                _shutdown()
+                return 5
+            node.get_logger().warn("DRY RUN: " + message)
+    if args.interface == "move_cp" and args.rate > 1.0:
+        node.get_logger().warn(
+            f"--interface move_cp at {args.rate:g} Hz: move_cp plans a "
+            "trajectory per message, so streaming it preempts each motion "
+            "before it accelerates and the arm barely travels. servo_cp is the "
+            "interface for an incremental servo."
+        )
+
     # Publishing into the void looks exactly like an arm that will not move,
     # and costs minutes to tell apart by eye. ROS knows the answer immediately.
+    # DDS matching is not instant. A publisher created milliseconds ago has no
+    # subscribers yet even when the other end has been up for hours, and every
+    # message published before the match completes is dropped with no error
+    # anywhere. tools/poke_arm.py waits for this and moves the arm; the node
+    # did not wait, and did not.
+    waited = 0.0
+    deadline = time.monotonic() + max(args.discovery_timeout_s, 0.0)
+    while time.monotonic() < deadline:
+        if all(c > 0 for c in node.command_subscribers().values()):
+            break
+        rclpy.spin_once(node, timeout_sec=0.1)
+        waited = time.monotonic() - (deadline - max(args.discovery_timeout_s, 0.0))
+    if waited > 0.05:
+        node.get_logger().info(
+            f"waited {waited:.2f} s for the command topics to be discovered"
+        )
+
     listeners = node.command_subscribers()
     deaf = [topic for topic, count in listeners.items() if count == 0]
     if deaf:

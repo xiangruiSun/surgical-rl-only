@@ -352,3 +352,33 @@ def test_the_gate_still_answers_the_topic(node_module, plan, baseline):
     assert node._confirm_callback() is True
     node._confirm = False
     assert node._confirm_callback() is False
+
+
+def test_a_slow_servo_rate_is_refused(node_module):
+    args = node_module.parse_args(
+        ["--grasp-pos", "0", "0", "0", "--interface", "servo_cp", "--rate", "5"]
+    )
+    assert args.rate < args.min_servo_rate, (
+        "5 Hz must be below the servo_cp floor; the two live runs that never "
+        "moved the arm were at 2 Hz and 5 Hz"
+    )
+
+
+def test_the_default_rate_clears_the_servo_floor(node_module):
+    args = node_module.parse_args(["--grasp-pos", "0", "0", "0"])
+    assert args.interface == "servo_cp"
+    assert args.rate >= args.min_servo_rate
+
+
+def test_a_discovery_timeout_exists_and_is_generous(node_module):
+    """Publishing before DDS matching completes drops the messages silently."""
+    args = node_module.parse_args(["--grasp-pos", "0", "0", "0"])
+    assert args.discovery_timeout_s >= 2.0
+
+
+def test_command_subscribers_reports_both_topics(node_module, plan, baseline):
+    node, _ = _build_node(
+        node_module, plan, baseline, ["--grasp-pos", "0", "0", "0"]
+    )
+    counts = node.command_subscribers()
+    assert set(counts) == {"/PSM1/servo_cp", "/PSM1/jaw/servo_jp"}
