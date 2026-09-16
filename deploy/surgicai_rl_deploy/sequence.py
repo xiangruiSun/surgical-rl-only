@@ -21,6 +21,13 @@ Phases
     Drive to the grasp pose with the jaw held open.  This is the existing,
     contract-verified :class:`~.loop.ApproachLoop`, unchanged, with whichever
     controller the operator chose (``rl`` / ``d2`` / ``residual``).
+``descend``
+    Close the standoff.  The approach policy aims 7 mm short of the needle,
+    along the tool's own axis, because that is where its training goal is
+    (``scene_manager.needle_goal_evaluator``'s ``lift_height``); in simulation
+    the grasp is then faked, so nothing there ever had to travel the last
+    7 mm.  On hardware something must, slowly and straight down the jaw axis.
+    Skipped when the plan has no standoff.
 ``settle``
     Stop.  Hold station at the grasp pose and require the *measured* pose to
     stop moving for several cycles.  Closing a gripper while the wrist is still
@@ -55,7 +62,7 @@ Phases
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
 import numpy as np
@@ -74,6 +81,7 @@ from .plan import GraspLiftPlan
 
 PHASE_STAGE = "stage"
 PHASE_APPROACH = "approach"
+PHASE_DESCEND = "descend"
 PHASE_SETTLE = "settle"
 PHASE_CLOSE = "close"
 PHASE_OBSERVE = "observe"
@@ -189,6 +197,14 @@ class SequenceConfig:
     #: the descent onto the entry point is the tightest motion in the run
     place_success_trans_cm: float = 0.2
     place_success_rot_deg: float = 3.0
+
+    # -- descend -----------------------------------------------------------
+    descend_max_steps: int = 200
+    descend_success_trans_cm: float = 0.05
+    descend_success_rot_deg: float = 2.0
+    #: the descent onto the needle is the one motion that can move the needle
+    #: before it is held, so it is deliberately slower than everything else
+    descend_step_mm: float = 0.5
 
     # -- settle ------------------------------------------------------------
     #: half-window length: the mean pose over the last ``settle_steps`` cycles
@@ -328,8 +344,8 @@ class GraspLiftSequencer:
         cfg = LoopConfig(
             frame_mode=self.cfg.frame_mode,
             goal_orientation="explicit",
-            goal_quat_xyzw=tuple(self.plan.grasp.quat_xyzw()),
-            goal_jaw=str(self.plan.grasp.jaw),
+            goal_quat_xyzw=tuple(self.plan.approach_target.quat_xyzw()),
+            goal_jaw=str(self.plan.approach_target.jaw),
             use_policy_jaw=False,
             max_steps=self.cfg.approach_max_steps,
             success_trans_cm=self.cfg.approach_success_trans_cm,
@@ -356,9 +372,9 @@ class GraspLiftSequencer:
             self.approach_controller, self._approach_config(), self.limits,
             contract=self.cfg.approach_contract,
         )
-        report = self._approach_loop.begin(measured, self.plan.grasp.p)
+        report = self._approach_loop.begin(measured, self.plan.approach_target.p)
         self.approach_report = report
-        self._segment_goal = self.plan.grasp
+        self._segment_goal = self.plan.approach_target
         return report
 
     def begin(self, start: ArmState) -> dict:
@@ -386,7 +402,8 @@ class GraspLiftSequencer:
                 "staging": (
                     None if self.cfg.approach_contract is None
                     else support_report(
-                        self.plan.staged, self.plan.grasp, self.cfg.approach_contract
+                        self.plan.staged, self.plan.approach_target,
+                        self.cfg.approach_contract,
                     )
                 ),
                 "stage_travel_cm": float(
@@ -413,7 +430,8 @@ class GraspLiftSequencer:
         self._pose_window = []
 
     def _start_segment(self, measured: Pose, goal: Pose, max_steps: int,
-                       success_trans_cm: float, success_rot_deg: float):
+                       success_trans_cm: float, success_rot_deg: float,
+                       limits: Optional[SafetyLimits] = None):
         """A geometric servo segment in the raw robot frame."""
         cfg = LoopConfig(
             frame_mode="identity",
@@ -432,11 +450,28 @@ class GraspLiftSequencer:
             integrate_policy_jaw=False,
             rot_metric="geodesic",
         )
-        loop = ApproachLoop(self.hold_controller, cfg, self.limits)
+        loop = ApproachLoop(self.hold_controller, cfg, limits or self.limits)
         loop.begin(measured, goal.p)
         self._segment_loop = loop
         self._segment_goal = goal
         return loop
+
+    def _begin_descent(self, measured: Pose, events: list):
+        """Travel the last few millimetres onto the needle, gently."""
+        slow = replace(self.limits, max_step_translation_mm=self.cfg.descend_step_mm)
+        self._start_segment(
+            measured, Pose(self.plan.grasp.p, self.plan.grasp.R, self.plan.grasp.jaw),
+            max_steps=self.cfg.descend_max_steps,
+            success_trans_cm=self.cfg.descend_success_trans_cm,
+            success_rot_deg=self.cfg.descend_success_rot_deg,
+            limits=slow,
+        )
+        events.append({
+            "i": self.index, "event": "descend_begin",
+            "standoff_mm": self.plan.grasp_standoff_m * 1000.0,
+            "step_mm": self.cfg.descend_step_mm,
+        })
+        self._enter(PHASE_DESCEND, "closing the standoff onto the needle")
 
     def _begin_transport(self, measured: Pose, events: list):
         """Leave the lift pose for the suturing point, with the needle held."""
@@ -682,14 +717,17 @@ class GraspLiftSequencer:
 
             if result.reason == "success":
                 self.grasp_pose_measured = measured.pose
-                self._start_segment(
-                    measured.pose,
-                    Pose(self.plan.grasp.p, self.plan.grasp.R, self.plan.grasp.jaw),
-                    max_steps=10_000,
-                    success_trans_cm=self.cfg.approach_success_trans_cm,
-                    success_rot_deg=self.cfg.approach_success_rot_deg,
-                )
-                self._enter(PHASE_SETTLE, "approach reached the grasp pose")
+                if self.plan.hover is not None:
+                    self._begin_descent(measured.pose, events)
+                else:
+                    self._start_segment(
+                        measured.pose,
+                        Pose(self.plan.grasp.p, self.plan.grasp.R, self.plan.grasp.jaw),
+                        max_steps=10_000,
+                        success_trans_cm=self.cfg.approach_success_trans_cm,
+                        success_rot_deg=self.cfg.approach_success_rot_deg,
+                    )
+                    self._enter(PHASE_SETTLE, "approach reached the grasp pose")
             elif result.done:
                 if self.cfg.on_approach_failure == "servo":
                     events.append({
@@ -714,6 +752,35 @@ class GraspLiftSequencer:
                         "the jaw untouched; nothing else will move until a human "
                         "decides what to do.",
                     )
+
+        # ------------------------------------------------------------------
+        elif self.phase == PHASE_DESCEND:
+            result = self._hold_command(measured)
+            action, clamps = result.action, result.clamps
+            command = Command(result.command, self.jaw.approach_open_rad)
+            trans_err, rot_err = result.trans_err_cm, result.rot_err_deg
+
+            if result.reason == "success":
+                self.grasp_pose_measured = measured.pose
+                events.append({
+                    "i": self.index, "event": "standoff_closed",
+                    "trans_err_cm": trans_err, "rot_err_deg": rot_err,
+                })
+                self._start_segment(
+                    measured.pose,
+                    Pose(self.plan.grasp.p, self.plan.grasp.R, self.plan.grasp.jaw),
+                    max_steps=10_000,
+                    success_trans_cm=self.cfg.approach_success_trans_cm,
+                    success_rot_deg=self.cfg.approach_success_rot_deg,
+                )
+                self._enter(PHASE_SETTLE, "jaws are at the needle")
+            elif result.done:
+                self._finish(
+                    PHASE_ABORTED,
+                    f"descend {result.reason}: the last "
+                    f"{self.plan.grasp_standoff_m * 1000:.1f} mm onto the needle "
+                    "did not finish, so the jaw was never closed",
+                )
 
         # ------------------------------------------------------------------
         elif self.phase == PHASE_SETTLE:

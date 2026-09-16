@@ -393,3 +393,28 @@ def test_the_measured_reference_is_still_available():
 
 def test_command_reference_is_the_default():
     assert SafetyLimits().step_reference == "command"
+
+
+def test_the_clamp_guard_only_watches_the_open_loop_case():
+    """A rate-limited servo is clamped on purpose and must not be aborted.
+
+    The slow descent onto the needle runs at 0.5 mm per cycle against a servo
+    that wants centimetres, so it is clamped every single cycle by design. The
+    streak guard exists to catch an open-loop policy whose free-running state
+    has drifted away from a held-back arm; a closed-loop controller sees the
+    clamped pose each cycle and has diverged from nothing.
+    """
+    limits = SafetyLimits(max_step_translation_mm=0.01, max_consecutive_clamps=3,
+                          max_tracking_error_cm=1000.0, workspace_pad_cm=1000.0)
+    action = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    closed = _loop(ConstantAction(action), observation_source="measured")
+    closed.limits = limits
+    for _ in range(12):
+        result = closed.step(Pose.from_vec7(START))
+        assert "safety clamp" not in result.reason
+
+    open_loop = _loop(ConstantAction(action), observation_source="command")
+    open_loop.limits = limits
+    reasons = [open_loop.step(Pose.from_vec7(START)).reason for _ in range(12)]
+    assert any("safety clamp" in r for r in reasons)

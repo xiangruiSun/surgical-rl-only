@@ -18,6 +18,7 @@ from surgicai_rl_deploy.mock import MockArm, MockJaw
 from surgicai_rl_deploy.plan import LiftSpec, TransportSpec, build_plan
 from surgicai_rl_deploy.sequence import (
     PHASE_ABORTED,
+    PHASE_DESCEND,
     PHASE_DONE,
     PHASE_PLACE,
     PHASE_STAGE,
@@ -539,3 +540,95 @@ def test_a_genuinely_slanted_descent_is_reported(start_pose, jaw_cal):
     descent = plan.suture.p - slanted.p
     lateral = np.linalg.norm(descent - lift_dir * np.dot(descent, lift_dir)) * 100.0
     assert lateral == pytest.approx(0.4, abs=1e-9)
+
+
+# ======================================================================
+# the grasp standoff: the policy's goal is not the needle
+# ======================================================================
+def test_the_hover_pose_is_the_grasp_pose_backed_off_along_the_tool_axis(
+    start_pose, jaw_cal
+):
+    p = pipeline_plan(start_pose, jaw_cal, grasp_standoff_m=0.007)
+    assert p.hover is not None
+    offset = p.grasp.p - p.hover.p
+    # purely along the tool's own z, 7 mm of it
+    assert float(np.dot(offset, p.grasp.R[:, 2])) == pytest.approx(0.007, abs=1e-12)
+    assert np.linalg.norm(
+        offset - p.grasp.R[:, 2] * np.dot(offset, p.grasp.R[:, 2])
+    ) == pytest.approx(0.0, abs=1e-12)
+    # and the orientation is unchanged, so the jaws already point at the needle
+    assert rotation_error_rad(p.hover, p.grasp) == pytest.approx(0.0, abs=1e-12)
+    assert "hover" in [n for n, _ in p.waypoints]
+
+
+def test_the_approach_aims_at_the_hover_not_the_grasp(start_pose, jaw_cal):
+    p = pipeline_plan(start_pose, jaw_cal, grasp_standoff_m=0.007)
+    assert np.allclose(p.approach_target.p, p.hover.p)
+    q = pipeline_plan(start_pose, jaw_cal)
+    assert q.hover is None
+    assert np.allclose(q.approach_target.p, q.grasp.p)
+
+
+def test_staging_is_solved_against_the_hover_pose(start_pose, jaw_cal):
+    """The support is relative to the policy's goal, which is the standoff."""
+    p = pipeline_plan(start_pose, jaw_cal, grasp_standoff_m=0.007,
+                      stage_contract=APPROACH_UPSTREAM)
+    assert support_report(p.staged, p.approach_target,
+                          APPROACH_UPSTREAM)["in_support"]
+
+
+def test_the_descent_runs_and_lands_on_the_needle(start_pose, jaw_cal, baseline):
+    plan = pipeline_plan(start_pose, jaw_cal, grasp_standoff_m=0.007)
+    seq, steps = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0))
+    assert seq.phase == PHASE_DONE, seq.reason
+    phases = [s.phase for s in steps]
+    assert PHASE_DESCEND in phases
+    assert phases.index(PHASE_DESCEND) < phases.index("settle")
+    closed = [e for e in seq.events if e.get("event") == "standoff_closed"]
+    assert closed and closed[0]["trans_err_cm"] < 0.1
+
+
+def test_the_descent_is_gentler_than_the_approach(start_pose, jaw_cal, baseline):
+    """It is the one motion that can move the needle before it is held."""
+    plan = pipeline_plan(start_pose, jaw_cal, grasp_standoff_m=0.007)
+    cfg = SequenceConfig(grasp_gate="always", descend_step_mm=0.5)
+    seq, steps = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0), cfg=cfg)
+    descend = [s for s in steps if s.phase == PHASE_DESCEND]
+    assert descend
+    moves = [
+        float(np.linalg.norm(b.command.pose.p - a.command.pose.p) * 1000.0)
+        for a, b in zip(descend, descend[1:])
+    ]
+    assert max(moves) <= 0.5 + 1e-6, f"descended {max(moves):.3f} mm in one cycle"
+
+
+def test_no_standoff_means_no_descend_phase(start_pose, jaw_cal, baseline):
+    plan = pipeline_plan(start_pose, jaw_cal)
+    seq, steps = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0))
+    assert seq.phase == PHASE_DONE, seq.reason
+    assert PHASE_DESCEND not in [s.phase for s in steps]
+
+
+def test_the_precheck_warns_when_a_policy_aims_straight_at_the_needle(
+    start_pose, jaw_cal
+):
+    plan = pipeline_plan(start_pose, jaw_cal)
+    assert status_of(precheck(plan, controller="rl"), "grasp_standoff") == WARN
+    # the servo has no training goal to miss, so this is not its problem
+    assert status_of(precheck(plan, controller="d2"), "grasp_standoff") == PASS
+    with_standoff = pipeline_plan(start_pose, jaw_cal, grasp_standoff_m=0.007)
+    assert status_of(precheck(with_standoff, controller="rl"),
+                     "grasp_standoff") == PASS
+
+
+def test_the_descend_budget_is_checked(start_pose, jaw_cal):
+    plan = pipeline_plan(start_pose, jaw_cal, grasp_standoff_m=0.007)
+    assert status_of(precheck(plan), "step_budget_descend") == PASS
+    starved = precheck(plan, descend_max_steps=3)
+    assert status_of(starved, "step_budget_descend") == FAIL
+
+
+def test_the_approach_contracts_carry_the_seven_millimetres(start_pose, jaw_cal):
+    assert APPROACH_UPSTREAM.grasp_standoff_m == pytest.approx(0.007)
+    # Place's goal is the entry pose itself, not a standoff from it
+    assert PLACE_UPSTREAM.grasp_standoff_m == pytest.approx(0.0)

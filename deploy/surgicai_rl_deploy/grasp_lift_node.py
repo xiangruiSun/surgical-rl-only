@@ -270,6 +270,12 @@ class GraspLiftNode(Node):
         report = self.sequencer.begin(state)
         self.get_logger().info(f"frame           : {self._measured_frame}")
         self.get_logger().info(f"start        cm : {np.round(state.pose.p * 100, 3)}")
+        if (hover := self.plan.hover) is not None:
+            self.get_logger().info(
+                f"hover        cm : {np.round(hover.p * 100, 3)}  "
+                f"({self.plan.grasp_standoff_m * 1000:.1f} mm short of the grasp "
+                "pose, along the tool axis -- this is where the POLICY aims)"
+            )
         self.get_logger().info(f"grasp        cm : {np.round(self.plan.grasp.p * 100, 3)}")
         self.get_logger().info(f"lift target  cm : {np.round(self.plan.lifted.p * 100, 3)}")
         self.get_logger().info(f"lift            : {self.plan.lift_spec.describe()}")
@@ -593,6 +599,15 @@ def parse_args(argv=None):
     ap.add_argument("--contract", choices=sorted(_CONTRACT_NAMES),
                     help="force a checkpoint contract instead of resolving it "
                          "from the model's SHA256")
+    ap.add_argument("--grasp-standoff-mm", type=float, default=None,
+                    help="how far short of the grasp pose the approach policy "
+                         "aims, along the tool axis. Default: the checkpoint "
+                         "contract's value (7 mm for the Approach policies, "
+                         "matching needle_goal_evaluator's lift_height). The "
+                         "remaining distance is a separate slow descent. 0 "
+                         "disables it and aims straight at the needle.")
+    ap.add_argument("--descend-step-mm", type=float, default=0.5)
+    ap.add_argument("--descend-max-steps", type=int, default=200)
     ap.add_argument("--suture-pos", nargs=3, type=float, default=None,
                     metavar=("X", "Y", "Z"),
                     help="TOOL position at the suturing point, metres, in the "
@@ -854,6 +869,11 @@ def main(argv=None) -> int:
         rclpy.shutdown()
         return 3
 
+    standoff = (
+        args.grasp_standoff_mm / 1000.0 if args.grasp_standoff_mm is not None
+        else (contract.grasp_standoff_m if contract is not None else 0.0)
+    )
+
     transport = None
     if args.suture_pos is not None:
         transport = TransportSpec(
@@ -872,6 +892,7 @@ def main(argv=None) -> int:
         goal_quat_xyzw=tuple(args.grasp_quat) if args.grasp_quat else None,
         lift=lift,
         jaw=jaw_cal,
+        grasp_standoff_m=standoff,
         suture_position_m=args.suture_pos,
         suture_quat_xyzw=tuple(args.suture_quat) if args.suture_quat else None,
         transport=transport,
@@ -893,6 +914,8 @@ def main(argv=None) -> int:
         max_step_rotation_deg=args.max_step_rotation_deg,
         approach_max_steps=args.approach_max_steps,
         lift_max_steps=args.lift_max_steps,
+        descend_max_steps=args.descend_max_steps,
+        descend_step_mm=args.descend_step_mm,
         transport_max_steps=args.transport_max_steps,
         place_max_steps=args.place_max_steps,
         success_trans_cm=args.lift_success_trans_cm,
@@ -912,6 +935,8 @@ def main(argv=None) -> int:
         frame_mode=args.frame_mode,
         approach_contract=contract,
         on_approach_failure=args.on_approach_failure,
+        descend_max_steps=args.descend_max_steps,
+        descend_step_mm=args.descend_step_mm,
         stage_max_steps=args.stage_max_steps,
         transport_max_steps=args.transport_max_steps,
         transport_success_trans_cm=args.transport_success_trans_cm,

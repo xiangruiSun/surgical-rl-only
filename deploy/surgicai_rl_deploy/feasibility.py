@@ -114,6 +114,8 @@ def precheck(
     max_step_translation_mm: float = 2.5,
     max_step_rotation_deg: float = 5.0,
     approach_max_steps: int = 200,
+    descend_max_steps: int = 200,
+    descend_step_mm: float = 0.5,
     lift_max_steps: int = 120,
     transport_max_steps: int = 600,
     place_max_steps: int = 400,
@@ -193,6 +195,39 @@ def precheck(
     else:
         report.add(
             "lift_vs_approach", WARN, "start and grasp coincide; no approach direction"
+        )
+
+    # -- 3a. the standoff the policy actually aims at -----------------------
+    if plan.hover is not None:
+        axis_mm = float(
+            np.dot(plan.grasp.p - plan.hover.p, plan.grasp.R[:, 2]) * 1000.0
+        )
+        off_axis_mm = float(
+            np.linalg.norm(
+                (plan.grasp.p - plan.hover.p)
+                - plan.grasp.R[:, 2] * np.dot(plan.grasp.p - plan.hover.p,
+                                              plan.grasp.R[:, 2])
+            ) * 1000.0
+        )
+        report.add(
+            "grasp_standoff",
+            PASS,
+            f"the approach policy aims {axis_mm:.1f} mm short of the grasp pose, "
+            "along the tool axis, which is where its training goal sits "
+            "(needle_goal_evaluator lift_height). The last "
+            f"{axis_mm:.1f} mm is a separate, slower descent.",
+            axis_mm=axis_mm,
+            off_axis_mm=off_axis_mm,
+        )
+    else:
+        report.add(
+            "grasp_standoff",
+            WARN if controller in ("rl", "residual") else PASS,
+            "no grasp standoff: the approach is aimed straight at the grasp "
+            "pose. The trained goal sits 7 mm short of it along the tool axis, "
+            "and in simulation the grasp is faked at that standoff, so a policy "
+            "asked to arrive AT the needle is being asked for a pose it was "
+            "never trained to reach. Pass --grasp-standoff-mm 7.",
         )
 
     # -- 3b. the suturing leg ----------------------------------------------
@@ -370,6 +405,16 @@ def precheck(
          approach_max_steps),
         ("lift", plan.lift_travel_cm, 0.0, lift_max_steps),
     ]
+    if plan.hover is not None:
+        # the descent runs at its own, slower, per-step cap
+        need = 2.0 * (plan.grasp_standoff_m * 1000.0) / max(descend_step_mm, 1e-6)
+        report.add(
+            "step_budget_descend",
+            FAIL if need > descend_max_steps else PASS,
+            f"descend needs roughly {need:.0f} of {descend_max_steps} cycles at "
+            f"{descend_step_mm:.2f} mm per step",
+            needed=need,
+        )
     if plan.staged is not None:
         segments.insert(0, (
             "stage",

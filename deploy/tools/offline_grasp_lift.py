@@ -129,6 +129,15 @@ def parse_args(argv=None):
                     help="force a checkpoint contract instead of resolving it "
                          "from the model's SHA256")
 
+    ap.add_argument("--grasp-standoff-mm", type=float, default=None,
+                    help="how far short of the grasp pose the approach policy "
+                         "aims, along the tool axis. Default: the checkpoint "
+                         "contract's value (7 mm for the Approach policies, "
+                         "matching needle_goal_evaluator's lift_height). The "
+                         "remaining distance is a separate slow descent. 0 "
+                         "disables it and aims straight at the needle.")
+    ap.add_argument("--descend-step-mm", type=float, default=0.5)
+    ap.add_argument("--descend-max-steps", type=int, default=200)
     ap.add_argument("--suture-pos", nargs=3, type=float, default=None,
                     metavar=("X", "Y", "Z"),
                     help="TOOL position at the suturing point, metres. This is "
@@ -254,6 +263,12 @@ def main(argv=None) -> int:
     controller, contract = build_controller(args)
     shadow_controller, shadow_contract = build_shadow(args)
 
+    # The policy's goal sits short of the needle; the contract knows by how much.
+    standoff = (
+        args.grasp_standoff_mm / 1000.0 if args.grasp_standoff_mm is not None
+        else (contract.grasp_standoff_m if contract is not None else 0.0)
+    )
+
     if args.suture_pos is not None and args.suture_quat is None:
         raise SystemExit(
             "--suture-pos needs --suture-quat: the point of the leg is to "
@@ -283,6 +298,7 @@ def main(argv=None) -> int:
         goal_quat_xyzw=tuple(args.grasp_quat) if args.grasp_quat else None,
         lift=lift,
         jaw=jaw_cal,
+        grasp_standoff_m=standoff,
         suture_position_m=args.suture_pos,
         suture_quat_xyzw=tuple(args.suture_quat) if args.suture_quat else None,
         transport=transport,
@@ -294,6 +310,8 @@ def main(argv=None) -> int:
     cfg = SequenceConfig(
         frame_mode=args.frame_mode,
         approach_contract=contract,
+        descend_max_steps=args.descend_max_steps,
+        descend_step_mm=args.descend_step_mm,
         on_approach_failure=args.on_approach_failure,
         grasp_gate=args.grasp_gate,
         on_slip=args.on_slip,
@@ -312,6 +330,8 @@ def main(argv=None) -> int:
         jaw_baseline=baseline,
         approach_max_steps=cfg.approach_max_steps,
         lift_max_steps=cfg.lift_max_steps,
+        descend_max_steps=cfg.descend_max_steps,
+        descend_step_mm=cfg.descend_step_mm,
         transport_max_steps=cfg.transport_max_steps,
         place_max_steps=cfg.place_max_steps,
         success_trans_cm=cfg.lift_success_trans_cm,

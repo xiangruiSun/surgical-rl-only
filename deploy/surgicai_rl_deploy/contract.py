@@ -229,6 +229,22 @@ class SubtaskContract:
     demo_episode_steps: int
     #: median straight-line travel, centimetres
     demo_travel_cm: float
+    #: How far short of the physical target the policy's goal sits, along the
+    #: tool's own approach axis, in metres.
+    #:
+    #: ``scene_manager.needle_goal_evaluator`` composes
+    #: ``needle_pose * translate(0,0,lift_height) * R_fixed`` with
+    #: ``lift_height = 0.007``, and ``R_fixed`` flips the tool z axis -- so the
+    #: goal is the grasp point backed off 7 mm along the gripper's own -z, with
+    #: the jaws pointing at it.  **The trained policy never drives into the
+    #: needle; it flies to a hover point and stops.**  In simulation the grasp
+    #: is then faked (``actuators[0].actuate("Needle")`` attaches the needle
+    #: regardless of where the jaws are), which is why this is easy to miss and
+    #: fatal to copy: closing the jaw at the policy's goal, on real hardware,
+    #: closes it 7 mm above the needle and holds nothing.
+    #:
+    #: 0 for subtasks whose goal is the physical target itself, like Place.
+    grasp_standoff_m: float = 0.0
     #: True once the step size has been reproduced from the checkpoint's own
     #: demonstrations to numerical zero.  False means it was read off a config
     #: file and nothing has checked it -- run tools/recover_step_size.py.
@@ -298,6 +314,7 @@ APPROACH_UPSTREAM = SubtaskContract(
     demo_goal_jaw=0.00,
     demo_episode_steps=121,
     demo_travel_cm=3.87,
+    grasp_standoff_m=0.007,
     step_size_verified=True,
     note=(
         "1.0 mm / 3 deg from RL_training_online.py; reproduces 19/20 of its own "
@@ -369,6 +386,7 @@ APPROACH_R6 = SubtaskContract(
     demo_goal_jaw=0.00,
     demo_episode_steps=120,
     demo_travel_cm=4.12,
+    grasp_standoff_m=0.007,
     step_size_verified=True,
     note=(
         "single-goal local revision. It inherited upstream's 1.0 mm / 3 deg "

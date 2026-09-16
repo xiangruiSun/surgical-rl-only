@@ -154,9 +154,32 @@ class GraspLiftPlan:
     jaw: JawCalibration
     #: pose to servo to before handing over to the approach policy
     staged: Optional[Pose] = None
+    #: how far short of the grasp pose the approach policy's goal sits, along
+    #: the tool's approach axis.  See SubtaskContract.grasp_standoff_m.
+    grasp_standoff_m: float = 0.0
     #: final tool pose at the suturing point, with the needle angled
     suture: Optional[Pose] = None
     transport_spec: Optional[TransportSpec] = None
+
+    @property
+    def hover(self) -> Optional[Pose]:
+        """Where the approach policy actually aims: short of the grasp pose.
+
+        The grasp pose backed off along the tool's own z axis, so the jaws end
+        up pointing at the needle from a standoff rather than at it.
+        """
+        if self.grasp_standoff_m <= 0.0:
+            return None
+        return Pose(
+            self.grasp.p - self.grasp.R[:, 2] * float(self.grasp_standoff_m),
+            self.grasp.R.copy(),
+            self.grasp.jaw,
+        )
+
+    @property
+    def approach_target(self) -> Pose:
+        """The pose the approach leg is asked to reach."""
+        return self.hover or self.grasp
 
     @property
     def via(self) -> Optional[Pose]:
@@ -171,6 +194,8 @@ class GraspLiftPlan:
         out = [("start", self.start)]
         if self.staged is not None:
             out.append(("staged", self.staged))
+        if (hover := self.hover) is not None:
+            out.append(("hover", hover))
         out += [("grasp", self.grasp), ("lifted", self.lifted)]
         if self.suture is not None:
             if (via := self.via) is not None:
@@ -224,6 +249,9 @@ class GraspLiftPlan:
 
     def as_dict(self) -> dict:
         extra = {}
+        if (hover := self.hover) is not None:
+            extra["hover_cm"] = (hover.p * 100.0).tolist()
+            extra["grasp_standoff_cm"] = self.grasp_standoff_m * 100.0
         if self.staged is not None:
             extra["staged_cm"] = (self.staged.p * 100.0).tolist()
             extra["staged_quat_xyzw"] = self.staged.quat_xyzw().tolist()
@@ -300,6 +328,7 @@ def build_plan(
     goal_quat_xyzw: Optional[tuple] = None,
     lift: Optional[LiftSpec] = None,
     jaw: Optional[JawCalibration] = None,
+    grasp_standoff_m: float = 0.0,
     suture_position_m=None,
     suture_quat_xyzw: Optional[tuple] = None,
     transport: Optional[TransportSpec] = None,
@@ -355,12 +384,20 @@ def build_plan(
         )
         transport = transport or TransportSpec()
 
+    # The policy aims at the standoff, so the support -- and therefore the
+    # staging pose -- is relative to THAT, not to the grasp pose.
+    approach_target = grasp_pose
+    if grasp_standoff_m > 0.0:
+        approach_target = Pose(
+            grasp_p - grasp_R[:, 2] * float(grasp_standoff_m), grasp_R, grasp_pose.jaw
+        )
+
     staged_pose = None
     if stage_contract is not None:
         from .staging import stage_pose_for
 
         staged_pose = stage_pose_for(
-            grasp_pose,
+            approach_target,
             stage_contract,
             offset_tool_cm=stage_offset_tool_cm,
             rotation_deg=stage_rotation_deg,
@@ -369,5 +406,6 @@ def build_plan(
 
     return GraspLiftPlan(
         start=start, grasp=grasp_pose, lifted=lifted_pose, lift_spec=lift, jaw=jaw,
-        staged=staged_pose, suture=suture_pose, transport_spec=transport,
+        staged=staged_pose, grasp_standoff_m=float(grasp_standoff_m),
+        suture=suture_pose, transport_spec=transport,
     )

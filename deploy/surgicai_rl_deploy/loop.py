@@ -536,6 +536,14 @@ class ApproachLoop:
             done, reason = True, "success"
         elif (
             self.limits.max_consecutive_clamps
+            # Only meaningful under the open-loop observation. There, the
+            # policy's state free-runs while the clamp holds the arm back, and
+            # sustained clamping means the two have silently stopped agreeing.
+            # A closed-loop servo sees the clamped pose every cycle, so it has
+            # not diverged from anything -- and a deliberately rate-limited
+            # segment, like the slow descent onto the needle, is clamped on
+            # purpose every single cycle.
+            and self.cfg.observation_source == "command"
             and self._clamp_streak >= self.limits.max_consecutive_clamps
         ):
             kinds = sorted({c["kind"] for c in clamps})
