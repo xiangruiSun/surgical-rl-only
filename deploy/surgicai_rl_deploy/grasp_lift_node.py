@@ -619,6 +619,7 @@ def build_limits(args) -> SafetyLimits:
         max_step_translation_mm=args.max_step_translation_mm,
         max_step_rotation_deg=args.max_step_rotation_deg,
         max_tracking_error_cm=tracking,
+        min_command_mm=args.min_command_mm,
     )
 
 
@@ -670,6 +671,13 @@ def parse_args(argv=None):
                          "remaining distance is a separate slow descent. 0 "
                          "disables it and aims straight at the needle.")
     ap.add_argument("--descend-step-mm", type=float, default=0.5)
+    ap.add_argument("--stage-success-trans-cm", type=float, default=0.2)
+    ap.add_argument("--descend-success-trans-cm", type=float, default=0.05,
+                    help="how close the jaws must get to the grasp pose before "
+                         "closing. Cannot be finer than the arm's deadband; the "
+                         "precheck refuses the combination.")
+    ap.add_argument("--transport-success-trans-cm", type=float, default=0.3)
+    ap.add_argument("--place-success-trans-cm", type=float, default=0.2)
     ap.add_argument("--descend-max-steps", type=int, default=200)
     ap.add_argument("--suture-pos", nargs=3, type=float, default=None,
                     metavar=("X", "Y", "Z"),
@@ -705,10 +713,8 @@ def parse_args(argv=None):
                     default="lift_height")
     ap.add_argument("--transport-clearance-cm", type=float, default=None)
     ap.add_argument("--transport-max-steps", type=int, default=600)
-    ap.add_argument("--transport-success-trans-cm", type=float, default=0.3)
     ap.add_argument("--transport-success-rot-deg", type=float, default=5.0)
     ap.add_argument("--place-max-steps", type=int, default=400)
-    ap.add_argument("--place-success-trans-cm", type=float, default=0.2)
     ap.add_argument("--place-success-rot-deg", type=float, default=3.0)
     ap.add_argument("--on-approach-failure", choices=["hold", "servo"],
                     default="hold",
@@ -818,6 +824,12 @@ def parse_args(argv=None):
     ap.add_argument("--max-step-translation-mm", type=float, default=2.5)
     ap.add_argument("--max-step-rotation-deg", type=float, default=5.0)
     ap.add_argument("--max-tracking-error-cm", type=float, default=1.5)
+    ap.add_argument("--min-command-mm", type=float, default=0.0,
+                    help="smallest commanded displacement this arm actually "
+                         "acts on. A proportional servo shrinks its step near "
+                         "the goal and stalls inside the deadband; below this "
+                         "the command is stretched up to it, never past the "
+                         "goal. Measure yours with tools/poke_arm.py.")
     ap.add_argument("--max-path-radius-cm", type=float, default=8.0)
     ap.add_argument("--limit-low", nargs=3, type=float, default=None,
                     help="hard positional box, metres, same frame as measured_cp")
@@ -993,48 +1005,20 @@ def main(argv=None) -> int:
         stage_rotation_deg=args.stage_rotation_deg,
     )
 
-    report = precheck(
-        plan,
-        controller=args.controller,
-        execute=args.execute,
-        grasp_gate=args.grasp_gate,
-        jaw_baseline=baseline,
-        max_path_radius_cm=args.max_path_radius_cm,
-        limit_low_m=args.limit_low,
-        limit_high_m=args.limit_high,
-        max_step_translation_mm=args.max_step_translation_mm,
-        max_step_rotation_deg=args.max_step_rotation_deg,
-        approach_max_steps=args.approach_max_steps,
-        lift_max_steps=args.lift_max_steps,
-        descend_max_steps=args.descend_max_steps,
-        descend_step_mm=args.descend_step_mm,
-        transport_max_steps=args.transport_max_steps,
-        place_max_steps=args.place_max_steps,
-        success_trans_cm=args.lift_success_trans_cm,
-        success_rot_deg=args.success_rot_deg,
-        suture_confirmed=args.suture_confirmed,
-        stage_contract=contract,
-        strict=args.strict,
-    )
-    print(report.render())
-    print()
-    if not report.ok:
-        print("refusing to run. Nothing was published.", file=sys.stderr)
-        _shutdown()
-        return 3
-
     cfg = SequenceConfig(
         frame_mode=args.frame_mode,
         approach_contract=contract,
         on_approach_failure=args.on_approach_failure,
         descend_max_steps=args.descend_max_steps,
         descend_step_mm=args.descend_step_mm,
+        descend_success_trans_cm=args.descend_success_trans_cm,
+        stage_success_trans_cm=args.stage_success_trans_cm,
+        place_success_trans_cm=args.place_success_trans_cm,
         stage_max_steps=args.stage_max_steps,
         transport_max_steps=args.transport_max_steps,
         transport_success_trans_cm=args.transport_success_trans_cm,
         transport_success_rot_deg=args.transport_success_rot_deg,
         place_max_steps=args.place_max_steps,
-        place_success_trans_cm=args.place_success_trans_cm,
         place_success_rot_deg=args.place_success_rot_deg,
         approach_max_steps=args.approach_max_steps,
         approach_success_trans_cm=args.success_trans_cm,
@@ -1056,6 +1040,47 @@ def main(argv=None) -> int:
         unwrap_rpy=not args.no_unwrap_rpy,
     )
     limits = build_limits(args)
+
+    report = precheck(
+        plan,
+        controller=args.controller,
+        execute=args.execute,
+        grasp_gate=args.grasp_gate,
+        jaw_baseline=baseline,
+        max_path_radius_cm=args.max_path_radius_cm,
+        limit_low_m=args.limit_low,
+        limit_high_m=args.limit_high,
+        max_step_translation_mm=args.max_step_translation_mm,
+        max_step_rotation_deg=args.max_step_rotation_deg,
+        approach_max_steps=args.approach_max_steps,
+        lift_max_steps=args.lift_max_steps,
+        descend_max_steps=args.descend_max_steps,
+        descend_step_mm=args.descend_step_mm,
+        min_command_mm=args.min_command_mm,
+        tolerances_mm={
+            'stage': cfg.stage_success_trans_cm * 10.0,
+            'approach': cfg.approach_success_trans_cm * 10.0,
+            'descend': cfg.descend_success_trans_cm * 10.0,
+            'lift': cfg.lift_success_trans_cm * 10.0,
+            **({} if plan.suture is None else {
+                'transport': cfg.transport_success_trans_cm * 10.0,
+                'place': cfg.place_success_trans_cm * 10.0}),
+        },
+        transport_max_steps=args.transport_max_steps,
+        place_max_steps=args.place_max_steps,
+        success_trans_cm=args.lift_success_trans_cm,
+        success_rot_deg=args.success_rot_deg,
+        suture_confirmed=args.suture_confirmed,
+        stage_contract=contract,
+        strict=args.strict,
+    )
+    print(report.render())
+    print()
+    if not report.ok:
+        print("refusing to run. Nothing was published.", file=sys.stderr)
+        _shutdown()
+        return 3
+
 
     sequencer = GraspLiftSequencer(
         plan, controller, cfg, limits, baseline,

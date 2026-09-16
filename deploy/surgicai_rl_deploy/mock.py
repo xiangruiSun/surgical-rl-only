@@ -74,10 +74,14 @@ class MockArm:
 
     def __init__(self, pose: Pose, jaw: MockJaw, *, lag: float = 0.0,
                  noise_mm: float = 0.0, seed: int = 0,
-                 jaw_calibration=None):
+                 jaw_calibration=None, deadband_mm: float = 0.0):
         self.pose = pose
         self.jaw = jaw
         self.lag = float(lag)
+        #: a commanded displacement smaller than this produces no motion at
+        #: all, which is what a real PSM does and what an ideal integrator --
+        #: the only arm SurgicAI ever trained against -- does not
+        self.deadband_mm = float(deadband_mm)
         self.noise_mm = float(noise_mm)
         self.rng = np.random.default_rng(seed)
         self.jaw_calibration = jaw_calibration
@@ -103,6 +107,10 @@ class MockArm:
         """Advance one cycle towards the commanded pose and jaw."""
         if command.publish_pose:
             target = command.pose
+            if self.deadband_mm > 0.0:
+                asked = float(np.linalg.norm(target.p - self.pose.p)) * 1000.0
+                if asked < self.deadband_mm:
+                    target = Pose(self.pose.p, target.R, target.jaw)
             p = self.pose.p + (target.p - self.pose.p) * (1.0 - self.lag)
             rel = Rotation.from_matrix(self.pose.R.T @ target.R).as_rotvec() * (
                 1.0 - self.lag

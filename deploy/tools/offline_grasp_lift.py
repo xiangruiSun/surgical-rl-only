@@ -137,6 +137,13 @@ def parse_args(argv=None):
                          "remaining distance is a separate slow descent. 0 "
                          "disables it and aims straight at the needle.")
     ap.add_argument("--descend-step-mm", type=float, default=0.5)
+    ap.add_argument("--stage-success-trans-cm", type=float, default=0.2)
+    ap.add_argument("--descend-success-trans-cm", type=float, default=0.05,
+                    help="how close the jaws must get to the grasp pose before "
+                         "closing. Cannot be finer than the arm's deadband; the "
+                         "precheck refuses the combination.")
+    ap.add_argument("--transport-success-trans-cm", type=float, default=0.3)
+    ap.add_argument("--place-success-trans-cm", type=float, default=0.2)
     ap.add_argument("--descend-max-steps", type=int, default=200)
     ap.add_argument("--suture-pos", nargs=3, type=float, default=None,
                     metavar=("X", "Y", "Z"),
@@ -222,6 +229,10 @@ def parse_args(argv=None):
                     help="pretend jaw/measured_js carries no effort field, as on "
                          "some arms; the evidence then rests on the jaw angle "
                          "alone, which a thin needle may not move far enough")
+    ap.add_argument("--min-command-mm", type=float, default=0.0)
+    ap.add_argument("--deadband-mm", type=float, default=0.0,
+                    help="mock arm ignores commanded displacements below this, "
+                         "like a real PSM does. Use it to reproduce a stall.")
     ap.add_argument("--lag", type=float, default=0.0)
     ap.add_argument("--noise-mm", type=float, default=0.0)
     ap.add_argument("--jaw-noise-deg", type=float, default=0.0)
@@ -332,6 +343,10 @@ def main(argv=None) -> int:
         approach_contract=contract,
         descend_max_steps=args.descend_max_steps,
         descend_step_mm=args.descend_step_mm,
+        descend_success_trans_cm=args.descend_success_trans_cm,
+        stage_success_trans_cm=args.stage_success_trans_cm,
+        transport_success_trans_cm=args.transport_success_trans_cm,
+        place_success_trans_cm=args.place_success_trans_cm,
         on_approach_failure=args.on_approach_failure,
         grasp_gate=args.grasp_gate,
         on_slip=args.on_slip,
@@ -340,7 +355,7 @@ def main(argv=None) -> int:
         settle_timeout_steps=args.settle_timeout_steps,
         residual_margin_deg=args.residual_margin_deg,
     )
-    limits = SafetyLimits()
+    limits = SafetyLimits(min_command_mm=args.min_command_mm)
 
     report = precheck(
         plan,
@@ -352,6 +367,16 @@ def main(argv=None) -> int:
         lift_max_steps=cfg.lift_max_steps,
         descend_max_steps=cfg.descend_max_steps,
         descend_step_mm=cfg.descend_step_mm,
+        min_command_mm=args.min_command_mm,
+        tolerances_mm={
+            'stage': cfg.stage_success_trans_cm * 10.0,
+            'approach': cfg.approach_success_trans_cm * 10.0,
+            'descend': cfg.descend_success_trans_cm * 10.0,
+            'lift': cfg.lift_success_trans_cm * 10.0,
+            **({} if plan.suture is None else {
+                'transport': cfg.transport_success_trans_cm * 10.0,
+                'place': cfg.place_success_trans_cm * 10.0}),
+        },
         transport_max_steps=cfg.transport_max_steps,
         place_max_steps=cfg.place_max_steps,
         success_trans_cm=cfg.lift_success_trans_cm,
@@ -381,6 +406,7 @@ def main(argv=None) -> int:
             drop_at_step=args.drop_at_step,
         ),
         lag=args.lag,
+        deadband_mm=args.deadband_mm,
         noise_mm=args.noise_mm,
         seed=args.seed,
         jaw_calibration=jaw_cal,

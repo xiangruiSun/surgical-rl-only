@@ -76,6 +76,21 @@ class SafetyLimits:
     max_tracking_error_cm: float = 1.5
     #: abort if measured_cp goes stale (ROS node only)
     max_pose_age_s: float = 0.25
+    #: Smallest commanded displacement the arm will actually act on, mm.
+    #:
+    #: A real PSM has a position deadband -- backlash, cable stretch, the
+    #: controller's own tolerance -- below which a new setpoint produces no
+    #: motion at all.  A proportional servo shrinks its step as it approaches
+    #: the goal, so it walks straight into that deadband and stalls: on
+    #: lcsr-dvrk-15 the staging move sat at 0.25 cm of error for 49 cycles
+    #: commanding 0.4 mm a cycle, while a hand-published 2 mm setpoint moved
+    #: the arm 1.947 mm. Nothing aborted, because the command was never more
+    #: than 0.4 mm ahead of the arm.
+    #:
+    #: So a commanded displacement that is non-zero but below this is stretched
+    #: up to it, along the same direction -- never past the goal, which would
+    #: just produce a limit cycle instead of a stall. 0 disables.
+    min_command_mm: float = 0.0
     #: abort after this many consecutive cycles in which a safety clamp had to
     #: modify the command.  With an open-loop observation (the training
     #: contract) the policy's internal state keeps integrating while the clamp
@@ -404,6 +419,25 @@ class ApproachLoop:
                 {"kind": "step_translation", "proposed_mm": norm * 1000.0,
                  "applied_mm": max_step * 1000.0}
             )
+        elif self.limits.min_command_mm > 0.0 and 1e-12 < norm:
+            floor = self.limits.min_command_mm / 1000.0
+            if norm < floor:
+                # Do not step past the goal: that trades a stall for a limit
+                # cycle, which is harder to see and no more useful.  The cap is
+                # how far there is left to go ALONG THE DIRECTION OF TRAVEL --
+                # the command's own direction need not point at the goal, so
+                # capping by the straight-line distance would still overshoot.
+                direction = delta / norm
+                remaining = float(
+                    np.dot(self.goal_robot.p - reference.p, direction)
+                )
+                stretched = min(floor, max(remaining, 0.0))
+                if stretched > norm:
+                    p = reference.p + delta * (stretched / norm)
+                    clamps.append(
+                        {"kind": "min_command", "proposed_mm": norm * 1000.0,
+                         "applied_mm": stretched * 1000.0}
+                    )
 
         from scipy.spatial.transform import Rotation
 
@@ -484,7 +518,11 @@ class ApproachLoop:
         command_robot = self.bridge.to_robot(command_policy)
         command_robot, clamps = self._clamp(measured, command_robot)
 
-        if clamps:
+        # Only clamps that HOLD THE COMMAND BACK say anything about the
+        # controller and the arm disagreeing.  min_command pushes the command
+        # forward, past a deadband the arm would otherwise swallow; counting it
+        # here aborts the very runs it exists to rescue.
+        if any(c["kind"] != "min_command" for c in clamps):
             self._clamp_streak += 1
             if self.cfg.resync_state_on_clamp:
                 resynced = self.bridge.to_policy(command_robot).to_vec7()

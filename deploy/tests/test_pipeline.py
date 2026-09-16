@@ -735,3 +735,79 @@ def test_compensation_can_be_switched_off(start_pose, jaw_cal, baseline):
 def test_an_unknown_compensation_mode_is_refused():
     with pytest.raises(ValueError, match="compensate_suture"):
         SequenceConfig(compensate_suture="sometimes")
+
+
+# ======================================================================
+# the arm's deadband, end to end
+# ======================================================================
+@pytest.mark.parametrize("deadband_mm", [0.5, 1.0, 1.5])
+def test_a_deadband_stalls_the_staging_move(start_pose, jaw_cal, baseline,
+                                            deadband_mm):
+    """What lcsr-dvrk-15 actually did: never arrives, never aborts."""
+    plan = pipeline_plan(start_pose, jaw_cal, stage_contract=APPROACH_UPSTREAM)
+    jaw = MockJaw(angle_rad=jaw_cal.approach_open_rad, block_at_rad=np.deg2rad(-5.0))
+    arm = MockArm(plan.start, jaw, jaw_calibration=jaw_cal, deadband_mm=deadband_mm)
+    arm.prime_jaw()
+    seq = GraspLiftSequencer(
+        plan, D2Controller(staged=True),
+        SequenceConfig(grasp_gate="always", stage_max_steps=120),
+        SafetyLimits(max_tracking_error_cm=50.0, workspace_pad_cm=50.0),
+        baseline,
+    )
+    seq.begin(arm.state())
+    for _ in range(4000):
+        step = seq.step(arm.state())
+        if step.done:
+            break
+        arm.apply(step.command)
+    assert seq.phase == PHASE_ABORTED
+    assert "stage" in seq.reason
+
+
+@pytest.mark.parametrize("deadband_mm", [0.5, 1.0])
+def test_a_command_floor_gets_through_the_deadband(start_pose, jaw_cal, baseline,
+                                                   deadband_mm):
+    plan = pipeline_plan(start_pose, jaw_cal, stage_contract=APPROACH_UPSTREAM)
+    jaw = MockJaw(angle_rad=jaw_cal.approach_open_rad, block_at_rad=np.deg2rad(-5.0))
+    arm = MockArm(plan.start, jaw, jaw_calibration=jaw_cal, deadband_mm=deadband_mm)
+    arm.prime_jaw()
+    seq = GraspLiftSequencer(
+        plan, D2Controller(staged=True),
+        SequenceConfig(grasp_gate="always",
+                       descend_success_trans_cm=max(0.05, deadband_mm / 5.0)),
+        SafetyLimits(max_tracking_error_cm=50.0, workspace_pad_cm=50.0,
+                     min_command_mm=deadband_mm * 1.2),
+        baseline,
+    )
+    seq.begin(arm.state())
+    steps = []
+    for _ in range(6000):
+        step = seq.step(arm.state())
+        steps.append(step)
+        if step.done:
+            break
+        arm.apply(step.command)
+    assert seq.phase == PHASE_DONE, seq.reason
+    assert np.linalg.norm(steps[-1].measured.pose.p - plan.suture.p) * 100.0 < 0.5
+
+
+def test_the_precheck_refuses_a_tolerance_finer_than_the_deadband(start_pose,
+                                                                  jaw_cal):
+    plan = pipeline_plan(start_pose, jaw_cal, grasp_standoff_m=0.007)
+    tolerances = {"descend": 0.5, "lift": 2.0}
+    bad = precheck(plan, min_command_mm=1.2, tolerances_mm=tolerances)
+    assert status_of(bad, "tolerance_vs_deadband") == FAIL
+    good = precheck(plan, min_command_mm=1.2,
+                    tolerances_mm={"descend": 2.0, "lift": 2.0})
+    assert status_of(good, "tolerance_vs_deadband") == PASS
+    # and with no declared deadband the check does not appear at all
+    assert "tolerance_vs_deadband" not in {c.name for c in precheck(plan).checks}
+
+
+def test_the_precheck_warns_when_the_descent_cannot_be_gentle(start_pose, jaw_cal):
+    plan = pipeline_plan(start_pose, jaw_cal, grasp_standoff_m=0.007)
+    report = precheck(plan, min_command_mm=1.8, descend_step_mm=0.5,
+                      tolerances_mm={"descend": 2.0})
+    assert status_of(report, "descend_step") == WARN
+    detail = next(c.detail for c in report.checks if c.name == "descend_step")
+    assert detail["effective_mm"] == pytest.approx(1.8)

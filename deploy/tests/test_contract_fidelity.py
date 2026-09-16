@@ -418,3 +418,58 @@ def test_the_clamp_guard_only_watches_the_open_loop_case():
     open_loop.limits = limits
     reasons = [open_loop.step(Pose.from_vec7(START)).reason for _ in range(12)]
     assert any("safety clamp" in r for r in reasons)
+
+
+# ======================================================================
+# the arm's deadband, which an ideal integrator does not have
+# ======================================================================
+def test_a_sub_deadband_command_is_stretched_to_the_floor():
+    """A proportional servo shrinks its step near the goal and stalls.
+
+    On lcsr-dvrk-15 the staging move sat at 0.25 cm of error for 49 cycles
+    commanding 0.4 mm a cycle, while a hand-published 2 mm setpoint moved the
+    arm 1.947 mm. Nothing aborted: the command was never more than 0.4 mm
+    ahead of the arm, so the tracking guard had nothing to say.
+    """
+    ctrl = ConstantAction(np.array([0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    limits = SafetyLimits(min_command_mm=1.0, max_tracking_error_cm=1000.0,
+                          workspace_pad_cm=1000.0, max_consecutive_clamps=0)
+    loop = _loop(ctrl)
+    loop.limits = limits
+    first = loop.step(Pose.from_vec7(START))
+    # 0.05 * 1.0 mm = 0.05 mm asked; the floor is 1.0 mm
+    moved = float(np.linalg.norm(first.command.p - START[:3])) * 1000.0
+    assert moved == pytest.approx(1.0, abs=1e-6)
+    assert [c["kind"] for c in first.clamps] == ["min_command"]
+
+
+def test_the_stretch_never_overshoots_the_goal():
+    """Trading a stall for a limit cycle is not an improvement."""
+    ctrl = ConstantAction(np.array([0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    limits = SafetyLimits(min_command_mm=50.0, max_tracking_error_cm=1000.0,
+                          workspace_pad_cm=1000.0, max_consecutive_clamps=0)
+    loop = _loop(ctrl)
+    loop.limits = limits
+    result = loop.step(Pose.from_vec7(START))
+    travelled = result.command.p - np.asarray(START[:3])
+    direction = travelled / np.linalg.norm(travelled)
+    # how far there was to go along the direction actually travelled
+    available = float(np.dot(np.asarray(GOAL[:3]) - np.asarray(START[:3]), direction))
+    assert float(np.linalg.norm(travelled)) <= available + 1e-9
+
+
+def test_the_stretch_is_off_by_default():
+    assert SafetyLimits().min_command_mm == 0.0
+
+
+def test_the_stretch_does_not_count_as_divergence():
+    """min_command pushes the command forward; the streak guard watches for it
+    being held back. Counting it aborted the runs it exists to rescue."""
+    ctrl = ConstantAction(np.array([0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    limits = SafetyLimits(min_command_mm=1.0, max_consecutive_clamps=3,
+                          max_tracking_error_cm=1000.0, workspace_pad_cm=1000.0)
+    loop = _loop(ctrl, observation_source="command")
+    loop.limits = limits
+    for _ in range(10):
+        result = loop.step(Pose.from_vec7(START))
+        assert "safety clamp" not in result.reason

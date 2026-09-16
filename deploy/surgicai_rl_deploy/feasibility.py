@@ -116,6 +116,8 @@ def precheck(
     approach_max_steps: int = 200,
     descend_max_steps: int = 200,
     descend_step_mm: float = 0.5,
+    min_command_mm: float = 0.0,
+    tolerances_mm: Optional[dict] = None,
     lift_max_steps: int = 120,
     transport_max_steps: int = 600,
     place_max_steps: int = 400,
@@ -196,6 +198,37 @@ def precheck(
         report.add(
             "lift_vs_approach", WARN, "start and grasp coincide; no approach direction"
         )
+
+    # -- 3z. can any of these tolerances be reached at all? ------------------
+    if min_command_mm > 0.0 and tolerances_mm:
+        unreachable = {
+            name: mm for name, mm in tolerances_mm.items() if mm < min_command_mm
+        }
+        if unreachable:
+            detail = ", ".join(
+                f"{name} {mm:.2f} mm" for name, mm in sorted(unreachable.items())
+            )
+            report.add(
+                "tolerance_vs_deadband",
+                FAIL,
+                f"this arm ignores commanded displacements below "
+                f"{min_command_mm:.2f} mm, so it cannot be brought within "
+                f"{detail}. Those segments would run to their step budget and "
+                "abort, having done nothing wrong. Widen the tolerance to at "
+                "least the deadband, or reduce the deadband if the arm is "
+                "actually capable of finer motion than --min-command-mm claims.",
+                deadband_mm=min_command_mm,
+                unreachable=unreachable,
+            )
+        else:
+            report.add(
+                "tolerance_vs_deadband",
+                PASS,
+                f"every segment tolerance is at or above this arm's "
+                f"{min_command_mm:.2f} mm deadband",
+                deadband_mm=min_command_mm,
+                tolerances_mm=tolerances_mm,
+            )
 
     # -- 3a. the standoff the policy actually aims at -----------------------
     if plan.hover is not None:
@@ -406,13 +439,27 @@ def precheck(
         ("lift", plan.lift_travel_cm, 0.0, lift_max_steps),
     ]
     if plan.hover is not None:
-        # the descent runs at its own, slower, per-step cap
-        need = 2.0 * (plan.grasp_standoff_m * 1000.0) / max(descend_step_mm, 1e-6)
+        # the descent runs at its own, slower, per-step cap -- unless the arm's
+        # deadband is larger, in which case that is the real step
+        effective = max(descend_step_mm, min_command_mm)
+        if min_command_mm > descend_step_mm:
+            report.add(
+                "descend_step",
+                WARN,
+                f"the descent was asked for {descend_step_mm:.2f} mm per cycle "
+                f"but this arm ignores commands below {min_command_mm:.2f} mm, "
+                f"so it will actually descend in {effective:.2f} mm steps. The "
+                "last motion before the jaws close is therefore as gentle as "
+                "the arm allows and no gentler.",
+                asked_mm=descend_step_mm,
+                effective_mm=effective,
+            )
+        need = 2.0 * (plan.grasp_standoff_m * 1000.0) / max(effective, 1e-6)
         report.add(
             "step_budget_descend",
             FAIL if need > descend_max_steps else PASS,
             f"descend needs roughly {need:.0f} of {descend_max_steps} cycles at "
-            f"{descend_step_mm:.2f} mm per step",
+            f"{effective:.2f} mm per step",
             needed=need,
         )
     if plan.staged is not None:

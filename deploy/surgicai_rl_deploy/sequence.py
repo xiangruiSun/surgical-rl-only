@@ -475,7 +475,15 @@ class GraspLiftSequencer:
 
     def _begin_descent(self, measured: Pose, events: list):
         """Travel the last few millimetres onto the needle, gently."""
-        slow = replace(self.limits, max_step_translation_mm=self.cfg.descend_step_mm)
+        # The descent cannot be gentler than the arm's deadband: a per-step cap
+        # below the floor leaves every command stretched straight back up to
+        # the floor, and the two fight until the segment times out.
+        slow = replace(
+            self.limits,
+            max_step_translation_mm=max(
+                self.cfg.descend_step_mm, self.limits.min_command_mm
+            ),
+        )
         self._start_segment(
             measured, Pose(self.plan.grasp.p, self.plan.grasp.R, self.plan.grasp.jaw),
             max_steps=self.cfg.descend_max_steps,
