@@ -121,10 +121,23 @@ def test_certified_tolerance_is_the_env_class_default():
         assert np.degrees(contract.env_info_rot_rad) == pytest.approx(10.0)
 
 
-def test_r6_is_flagged_unverified():
-    assert APPROACH_R6.step_size_verified is False
-    assert APPROACH_UPSTREAM.step_size_verified is True
-    assert "UNVERIFIED" in APPROACH_R6.describe()
+def test_every_registered_contract_has_a_measured_scale():
+    """R6's was unverified until 2026-09-16; the replay settled it at 1.0 mm."""
+    for contract in CONTRACTS.values():
+        assert contract.step_size_verified is True, contract.name
+        assert "UNVERIFIED" not in contract.describe()
+
+
+def test_r6_acts_at_the_upstream_scale():
+    """46/50 at 1.0 mm against 36/50 at the 1.5 mm this package used to apply."""
+    assert APPROACH_R6.step_size[0] == pytest.approx(1.0e-3)
+    assert np.degrees(APPROACH_R6.step_size[3]) == pytest.approx(3.0)
+    np.testing.assert_allclose(
+        APPROACH_R6.step_size[:6], APPROACH_UPSTREAM.step_size[:6], rtol=1e-9
+    )
+    # but its tolerance and budget are its own, and beat upstream's on it
+    assert APPROACH_R6.success_trans_cm == pytest.approx(1.0)
+    assert APPROACH_R6.max_steps == 200
 
 
 def test_checkpoints_resolve_to_contracts():

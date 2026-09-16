@@ -23,9 +23,28 @@ from __future__ import annotations
 import numpy as np
 
 # --- action scaling -------------------------------------------------------
-# RL/utils/utils.py :: default_step_size(trans_step=1.5e-3, angle_step_deg=3.0,
-# jaw_step=0.05); identical to collect_measured_approach_demos.STEP_SIZE_RAW.
+# The package-wide fallback, used only when no checkpoint contract applies.
+#
+# This was 1.5 mm for most of this project's life, taken from
+# RL/utils/utils.py :: default_step_size in THIS repository. It is wrong for
+# every checkpoint measured so far. Upstream trains and evaluates at 1.0 mm /
+# 3 deg (RL/RL_training_online.py, RL/Model_evaluation.py), and replaying each
+# checkpoint from its own demonstrations says the same:
+#
+#     checkpoint   0.5 mm/2deg   1.0 mm/3deg   1.5 mm/3deg   2.0 mm/2deg
+#     upstream       7/20 35%     19/20 95%         --            --
+#     R6            24/50 48%     46/50 92%     36/50 72%     10/50 20%
+#
+# So 1.5 mm was 50% over scale on R6, which is what made a working policy
+# track for a few steps and then orbit the goal. Reproduce with
+# tools/replay_demos.py --compare.
 STEP_SIZE_RAW = np.array(
+    [1.0e-3, 1.0e-3, 1.0e-3, np.deg2rad(3.0), np.deg2rad(3.0), np.deg2rad(3.0), 0.05],
+    dtype=np.float32,
+)
+
+#: what this package used to apply, kept so the regression can be measured
+LEGACY_STEP_SIZE_RAW = np.array(
     [1.5e-3, 1.5e-3, 1.5e-3, np.deg2rad(3.0), np.deg2rad(3.0), np.deg2rad(3.0), 0.05],
     dtype=np.float32,
 )
@@ -329,7 +348,7 @@ PLACE_UPSTREAM = SubtaskContract(
 #: deg, so treat this as suspect until tools/recover_step_size.py says otherwise.
 APPROACH_R6 = SubtaskContract(
     name="Approach (R6 single-goal revision)",
-    step_size=np.asarray(STEP_SIZE_RAW, dtype=np.float64),
+    step_size=_step(1.0, 3.0, 0.05),
     demo_step_size=_step(1.5, 3.0, 0.05),
     success_trans_cm=1.0,
     env_info_trans_cm=0.5,
@@ -350,14 +369,16 @@ APPROACH_R6 = SubtaskContract(
     demo_goal_jaw=0.00,
     demo_episode_steps=120,
     demo_travel_cm=4.12,
-    step_size_verified=False,
+    step_size_verified=True,
     note=(
-        "single-goal local revision. 1.5 mm / 3 deg came from this repository's "
-        "own training sources, not from upstream, and no replay has confirmed "
-        "it. Upstream trains at 1.0 mm / 3 deg; if R6 inherited that and is "
-        "being driven at 1.5 mm, it is running 50% over scale. Settle it with "
-        "tools/replay_demos.py --compare, which measures the policy rather than "
-        "the demonstrations."
+        "single-goal local revision. It inherited upstream's 1.0 mm / 3 deg "
+        "after all: replayed from its own 50 demonstration starts against a "
+        "perfect arm, 1.0 mm/3 deg gives 46/50 (92%) where the 1.5 mm/3 deg "
+        "this package applied gives 36/50 (72%), 0.5 mm/2 deg gives 24/50 and "
+        "2.0 mm/2 deg gives 10/50. Every R6 result recorded in this project "
+        "before 2026-09-16 was taken 50% over scale. Its own tolerance "
+        "(1.0 cm / 10 deg, 200 steps) beats the upstream pair on this "
+        "checkpoint: 46/50 against 34/50."
     ),
 )
 

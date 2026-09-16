@@ -244,18 +244,54 @@ def test_the_jaw_is_never_opened_while_loaded(start_pose, jaw_cal, baseline):
         assert s.command.jaw_rad <= jaw_cal.grip_rad + 1e-9
 
 
-def test_losing_the_needle_in_transport_stops_rather_than_descends(
-    start_pose, jaw_cal, baseline
+@pytest.mark.parametrize("drop_at", [90, 110, 120, 130, 150])
+def test_losing_the_needle_while_loaded_never_descends_further(
+    start_pose, jaw_cal, baseline, drop_at
 ):
+    """The invariant, stated as height rather than as a phase name.
+
+    Which phase the needle is dropped in depends on cycle counts, and cycle
+    counts move whenever the action scale or a tolerance changes -- so a test
+    that names a phase tests the timing, not the safety property. The property
+    is: once the jaw evidence is gone, the tool does not go any further down
+    toward the tissue, wherever it happened to be at the time.
+    """
+    plan = pipeline_plan(start_pose, jaw_cal)
+    cfg = SequenceConfig(grasp_gate="evidence", on_slip="lower")
+    seq, steps = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0),
+                     cfg=cfg, drop_at=drop_at)
+
+    lost = next((e for e in seq.events if e.get("event") == "jaw_evidence_lost"),
+                None)
+    if lost is None:
+        return  # the drop landed before evidence was ever established
+
+    lift_dir = plan.lift_spec.direction(plan.grasp)
+    # height above the suturing pose, along the lift axis: larger is safer
+    height = lambda p: float(np.dot(p - plan.suture.p, lift_dir))  # noqa: E731
+    at_loss = next(height(s.measured.pose.p) for s in steps if s.index == lost["i"])
+
+    after = [s for s in steps if s.index > lost["i"]]
+    for s in after:
+        assert height(s.command.pose.p) >= at_loss - 1e-3, (
+            f"descended {1000*(at_loss - height(s.command.pose.p)):.2f} mm after "
+            f"losing the needle, at cycle {s.index} in phase {s.phase}"
+        )
+
+
+def test_a_slip_while_loaded_is_recorded_and_stops_the_run(start_pose, jaw_cal,
+                                                           baseline):
     plan = pipeline_plan(start_pose, jaw_cal)
     cfg = SequenceConfig(grasp_gate="evidence", on_slip="lower")
     seq, steps = run(plan, jaw_cal, baseline, block_at=np.deg2rad(-5.0),
                      cfg=cfg, drop_at=120)
-    if PHASE_TRANSPORT in [s.phase for s in steps]:
-        # if the drop landed during the transport, we must not have descended
-        if seq.phase == PHASE_ABORTED:
-            assert "holding position rather than descending" in seq.reason
-            assert PHASE_PLACE not in [s.phase for s in steps]
+    lost = [e for e in seq.events if e.get("event") == "jaw_evidence_lost"]
+    assert lost, "the drop should have been noticed"
+    assert seq.phase == PHASE_ABORTED
+    assert "jaw evidence disappeared" in seq.reason
+    # and the jaw was never opened on the way out
+    assert all(s.command.jaw_rad <= jaw_cal.grip_rad + 1e-9
+               for s in steps if s.index >= lost[0]["i"])
 
 
 def test_stage_failure_never_starts_the_policy(start_pose, jaw_cal, baseline):

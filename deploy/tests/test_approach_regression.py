@@ -23,13 +23,28 @@ from conftest import REAL_GOAL_POS, REAL_START_POS, REAL_START_QUAT
 
 # --- the frozen contract --------------------------------------------------
 def test_step_size_is_the_training_contract():
-    """1.5 mm / 3 deg / 0.05 jaw, translation in METRES while the observation
-    is in centimetres. The asymmetry is the contract, not a bug."""
+    """1.0 mm / 3 deg / 0.05 jaw, translation in METRES while the observation
+    is in centimetres. The asymmetry is the contract, not a bug.
+
+    This pinned 1.5 mm until 2026-09-16, taken from this repository's own
+    RL/utils/utils.py. Replaying each checkpoint from its own demonstrations
+    says otherwise -- R6 gives 46/50 at 1.0 mm against 36/50 at 1.5 mm, and
+    upstream 19/20 against 7/20 at 0.5 mm -- and both training scripts
+    hard-code 1.0e-3. See contract.LEGACY_STEP_SIZE_RAW for what was applied
+    before, and tools/replay_demos.py --compare to reproduce.
+    """
     np.testing.assert_allclose(
         STEP_SIZE_RAW,
-        [1.5e-3, 1.5e-3, 1.5e-3, np.deg2rad(3.0), np.deg2rad(3.0), np.deg2rad(3.0), 0.05],
+        [1.0e-3, 1.0e-3, 1.0e-3, np.deg2rad(3.0), np.deg2rad(3.0), np.deg2rad(3.0), 0.05],
         rtol=1e-6, atol=0,  # STEP_SIZE_RAW is stored float32, as in training
     )
+
+
+def test_the_legacy_scale_is_kept_and_is_different():
+    from surgicai_rl_deploy.contract import LEGACY_STEP_SIZE_RAW
+
+    assert LEGACY_STEP_SIZE_RAW[0] == pytest.approx(1.5e-3)
+    assert not np.allclose(LEGACY_STEP_SIZE_RAW, STEP_SIZE_RAW)
 
 
 def test_goal_scale_is_cm_for_position_and_raw_for_the_rest():
