@@ -29,7 +29,7 @@ The start pose is read from the arm; you do not pass it.
     python3 run_pipeline.py \
         --grasp-pos  <x y z> --grasp-quat <qx qy qz qw> \
         --suture-pos <x y z> --suture-quat <qx qy qz qw> --suture-confirmed \
-        --controller d2 --interface move_cp --rate 2 \
+        --controller d2 --interface servo_cp --rate 10 --grasp-gate manual \
         --lift-sign -1 --jaw-baseline jaw_baseline.json \
         --trace live.jsonl --execute
 

@@ -382,3 +382,98 @@ def test_command_subscribers_reports_both_topics(node_module, plan, baseline):
     )
     counts = node.command_subscribers()
     assert set(counts) == {"/PSM1/servo_cp", "/PSM1/jaw/servo_jp"}
+
+
+@pytest.mark.parametrize('reply', ['yes', 'no', 'timeout'])
+def test_terminal_confirmation_controls_full_pipeline(
+    node_module, start_pose, jaw_cal, baseline, monkeypatch, reply
+):
+    """Drive real phase transitions and terminal callback against the mock arm."""
+    import io
+    from surgicai_rl_deploy.mock import MockArm, MockJaw
+    from surgicai_rl_deploy.plan import LiftSpec, build_plan
+    from surgicai_rl_deploy.sequence import PHASE_WAIT_OPERATOR
+
+    p = build_plan(
+        start_pose, [-0.050726357, 0.015332369, 0.049514053], jaw=jaw_cal,
+        lift=LiftSpec(axis='z', sign=-1, distance_m=0.015, explicit=True),
+        suture_position_m=[-0.040, 0.005, 0.040],
+        suture_quat_xyzw=[0, 0, 0, 1],
+    )
+    node, seq = _build_node(node_module, p, baseline,
+                           ['--grasp-pos', '0', '0', '0', '--execute'])
+    seq.cfg.grasp_gate = 'manual'
+    seq.cfg.operator_timeout_steps = 8
+    seq.limits.max_path_radius_cm = 30
+    arm = MockArm(p.start, MockJaw(angle_rad=jaw_cal.approach_open_rad),
+                  jaw_calibration=jaw_cal)
+    arm.prime_jaw()
+
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    terminal = Terminal(reply + '\n')
+    monkeypatch.setattr(node_module.sys, 'stdin', terminal)
+    calls = []
+
+    def ready(*args):
+        calls.append(seq.phase)
+        assert seq.phase == PHASE_WAIT_OPERATOR
+        assert seq.jaw_command_rad == pytest.approx(jaw_cal.grip_rad)
+        # No motion into lift before the operator has answered.
+        return ([terminal], [], []) if len(calls) >= 4 and reply != 'timeout' else ([], [], [])
+
+    monkeypatch.setattr(node_module.select, 'select', ready)
+    seq.confirm_callback = node._confirm_callback
+    seq.begin(arm.state())
+    phases = []
+    for _ in range(3000):
+        step = seq.step(arm.state())
+        phases.append(step.phase)
+        arm.apply(step.command)
+        if step.done:
+            break
+    assert step.done
+    assert len(calls) >= 4
+    assert 'close' in phases and 'wait_operator' in phases
+    assert any('Was the grasp successful?' in m for _, m in node.get_logger().lines)
+    assert any('transport, then descend' in m for _, m in node.get_logger().lines)
+    if reply == 'yes':
+        assert seq.reason == 'success'
+        assert 'lift' in phases and 'transport' in phases and 'place' in phases
+        assert np.linalg.norm(arm.pose.p - seq.suture_target.p) <= seq.cfg.place_success_trans_cm / 100
+    else:
+        assert 'lift' not in phases and 'transport' not in phases
+        expected = 'operator declined the lift' if reply == 'no' else 'operator confirmation timed out'
+        assert seq.reason == expected
+    assert arm.jaw.angle_rad == pytest.approx(jaw_cal.grip_rad)
+
+
+def test_topic_confirmation_before_grasp_is_ignored(node_module, plan, baseline):
+    from types import SimpleNamespace
+    from surgicai_rl_deploy.sequence import PHASE_WAIT_OPERATOR
+    node, seq = _build_node(node_module, plan, baseline, ['--grasp-pos', '0', '0', '0'])
+    seq.begin(node._state())
+    node._on_confirm(SimpleNamespace(data=True))
+    assert node._confirm is None
+    seq.phase = PHASE_WAIT_OPERATOR
+    node._on_confirm(SimpleNamespace(data=True))
+    assert node._confirm is True
+
+
+def test_manual_live_run_requires_a_confirmation_channel(node_module, monkeypatch, capsys):
+    monkeypatch.setattr(node_module.sys, 'stdin', None)
+    assert node_module.main(['--grasp-pos', '0', '0', '0', '--execute']) == 2
+    assert 'interactive terminal or --confirm-topic' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('argv, expected', [
+    ([], 1200),
+    (['--rate', '5'], 600),
+    (['--operator-timeout-s', '0'], 0),
+    (['--operator-timeout-steps', '7'], 7),
+])
+def test_operator_wait_budget(node_module, argv, expected):
+    args = node_module.parse_args(['--grasp-pos', '0', '0', '0'] + argv)
+    assert args.operator_timeout_steps == expected

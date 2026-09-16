@@ -1,3 +1,31 @@
+## Interactive grasp confirmation on rebuilt
+
+Use `--grasp-gate manual` for approach, descent, settle, jaw closure,
+operator confirmation, lift, and transport. The diagnostic `--grasp-gate never`
+intentionally stops after closing; it never asks a question or lifts.
+
+After closure and observation, the prompt asks whether the grasp succeeded.
+Inspect the needle, then type `yes` (or `y`) and Enter to permit lift and
+transport. `no` stops without lifting or opening the jaws. The existing slip,
+freshness, tracking and workspace guards remain active. Invalid input asks
+again; topic confirmations received before the operator gate are ignored.
+A live manual run needs an interactive terminal or `--confirm-topic`.
+
+The default wait budget is 120 seconds converted to control cycles at `--rate`;
+a slow executor can take longer in wall-clock time. Change it with
+`--operator-timeout-s`; 0 explicitly waits indefinitely.
+`--operator-timeout-steps` overrides the conversion. Timeout aborts without lifting.
+
+Transport needs `--suture-pos X Y Z` (tool position in metres in the measured
+pose frame) and `--suture-quat QX QY QZ QW` (tool orientation), plus
+`--suture-confirmed` for live execution. Without a destination, yes permits
+lifting only. Arrival keeps the jaw closed; it does not insert or release the
+needle. Do not substitute the grasp pose for the suturing pose.
+
+If no question appears, inspect the phase in the final log lines or JSONL trace.
+`approach`, `descend`, and `settle` precede jaw closure: failure to converge
+there is not an operator-gate problem.
+
 # The suturing pipeline on a real dVRK PSM
 
 **stage → approach → settle → close the jaw → observe → lift → transport →

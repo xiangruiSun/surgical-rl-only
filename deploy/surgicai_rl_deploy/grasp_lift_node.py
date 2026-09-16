@@ -153,6 +153,9 @@ class GraspLiftNode(Node):
         self._jaw_stamp = time.monotonic()
 
     def _on_confirm(self, msg: Bool):
+        if self.sequencer.phase != PHASE_WAIT_OPERATOR:
+            self.get_logger().warn("Ignoring grasp confirmation before the operator gate.")
+            return
         self._confirm = bool(msg.data)
 
     # -- helpers -----------------------------------------------------------
@@ -203,7 +206,8 @@ class GraspLiftNode(Node):
             self._confirm_prompted_at = now
             summary = self.sequencer.window.summary()
             self.get_logger().warn("=" * 68)
-            self.get_logger().warn("JAW IS CLOSED. The lift is waiting for you.")
+            self.get_logger().warn("JAW CLOSURE COMMANDED. The lift is waiting for you.")
+            self.get_logger().warn("Was the grasp successful? Inspect whether the needle is held.")
             self.get_logger().warn(
                 f"  jaw evidence: {summary['blocked_samples']}/{summary['samples']} "
                 f"samples show the jaw stopping early"
@@ -221,7 +225,21 @@ class GraspLiftNode(Node):
                     f"  publish true on {self.args.confirm_topic} to lift, "
                     "false to stop"
                 )
-            self.get_logger().warn("  or type 'y' + Enter to lift, 'n' + Enter to stop")
+            if self.plan.suture is not None:
+                self.get_logger().warn(
+                    "  YES: lift, transport, then descend to the configured suturing "
+                    "tool pose; keep the jaws closed."
+                )
+            else:
+                self.get_logger().warn(
+                    "  YES: lift only. No suturing destination was supplied."
+                )
+            self.get_logger().warn("  Type 'yes' + Enter to proceed, 'no' + Enter to stop.")
+            if self.sequencer.cfg.operator_timeout_steps:
+                self.get_logger().warn(
+                    f"  No answer: abort after {self.sequencer.cfg.operator_timeout_steps} "
+                    "control cycles without lifting or opening the jaws."
+                )
             self.get_logger().warn("=" * 68)
 
         if self._confirm is not None:
@@ -237,7 +255,7 @@ class GraspLiftNode(Node):
                 self.get_logger().warn(
                     f"DRY RUN: nobody answered in {waited:.0f} s, so the gate is "
                     "being released automatically to show the rest of the "
-                    "sequence. A live run waits indefinitely."
+                    "sequence. A live run never confirms automatically."
                 )
                 return True
 
@@ -249,6 +267,7 @@ class GraspLiftNode(Node):
                     return True
                 if line in ("n", "no"):
                     return False
+                self.get_logger().warn("Please type yes or no, then press Enter.")
         return None
 
     def _publish(self, command):
@@ -338,6 +357,16 @@ class GraspLiftNode(Node):
             )
         self.get_logger().info(f"{self.jaw_cal.describe()}")
         self.get_logger().info(f"grasp gate      : {self.sequencer.cfg.grasp_gate}")
+        if self.sequencer.cfg.grasp_gate == "never":
+            self.get_logger().warn(
+                "--grasp-gate never: stop after jaw closure, with NO question, "
+                "lift or transport. Use --grasp-gate manual for operator confirmation."
+            )
+        if self.plan.suture is None:
+            self.get_logger().warn(
+                "No suturing destination: this run cannot transport to the suturing "
+                "point. Supply --suture-pos and --suture-quat to include transport."
+            )
         # The R6 support bounds the learned policy and nothing else.  Logging
         # it as a warning under the geometric servo contradicts the precheck,
         # which has already said the trained region does not apply -- and a
@@ -781,7 +810,11 @@ def parse_args(argv=None):
                     choices=["manual", "evidence", "always", "never"], default="manual")
     ap.add_argument("--confirm-topic", default=None,
                     help="std_msgs/Bool topic that releases the manual gate")
-    ap.add_argument("--operator-timeout-steps", type=int, default=0)
+    ap.add_argument("--operator-timeout-s", type=float, default=120.0,
+                    help="manual-gate wait budget converted to cycles at --rate; "
+                         "default 120 seconds nominally. 0 waits indefinitely.")
+    ap.add_argument("--operator-timeout-steps", type=int, default=None,
+                    help="override the manual-gate cycle budget; 0 waits indefinitely")
     ap.add_argument("--on-slip", choices=["abort", "continue", "lower"], default="abort")
 
     # controller
@@ -867,12 +900,25 @@ def parse_args(argv=None):
     ap.add_argument("--execute", action="store_true",
                     help="actually publish; without it this is a dry run")
     parsed = ap.parse_args(argv)
+    if not np.isfinite(parsed.operator_timeout_s) or parsed.operator_timeout_s < 0:
+        ap.error("--operator-timeout-s must be finite and nonnegative")
+    if parsed.operator_timeout_steps is None:
+        if not np.isfinite(parsed.rate) or parsed.rate <= 0:
+            ap.error("--rate must be finite and positive")
+        parsed.operator_timeout_steps = int(np.ceil(parsed.operator_timeout_s * parsed.rate))
+    elif parsed.operator_timeout_steps < 0:
+        ap.error("--operator-timeout-steps must be nonnegative")
     parsed.dry_run_simulate = not parsed.dry_run_static
     return parsed
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if (args.execute and args.grasp_gate == "manual" and not args.confirm_topic
+            and not (sys.stdin is not None and sys.stdin.isatty())):
+        print("Manual grasp confirmation needs an interactive terminal or "
+              "--confirm-topic. No commands were published.", file=sys.stderr)
+        return 2
 
     jaw_cal = JawCalibration(
         open_rad=float(np.deg2rad(args.jaw_open_deg)),
