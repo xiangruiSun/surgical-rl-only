@@ -53,6 +53,7 @@ from .frames import Pose
 from .jaw import JawBaseline, JawCalibration, JawCalibrationError
 from .loop import SafetyLimits
 from .contract import CONTRACTS
+from .calib import cli as calib_cli
 from .plan import LiftSpec, TransportSpec, build_plan
 
 _CONTRACT_NAMES = tuple(CONTRACTS)
@@ -709,8 +710,10 @@ def parse_args(argv=None):
                          "place legs, logged and never published")
     ap.add_argument("--shadow-contract", choices=sorted(_CONTRACT_NAMES))
     ap.add_argument(
-        "--grasp-pos", nargs=3, type=float, required=True, metavar=("X", "Y", "Z"),
-        help="where to close the jaw, in metres, in the SAME frame as measured_cp",
+        "--grasp-pos", nargs=3, type=float, default=None, metavar=("X", "Y", "Z"),
+        help="where to close the jaw, in metres, in the SAME frame as "
+             "measured_cp. Either this or --needle-pose is required; if both "
+             "are given the typed pose wins.",
     )
     ap.add_argument("--grasp-quat", nargs=4, type=float, default=None,
                     metavar=("QX", "QY", "QZ", "QW"))
@@ -826,13 +829,49 @@ def parse_args(argv=None):
                     help="treat every precheck warning as a failure")
     ap.add_argument("--execute", action="store_true",
                     help="actually publish; without it this is a dry run")
+    calib_cli.add_arguments(ap)
+
     parsed = ap.parse_args(argv)
     parsed.dry_run_simulate = not parsed.dry_run_static
+    if parsed.grasp_pos is None and not parsed.needle_pose:
+        ap.error(
+            "one of --grasp-pos (three numbers you measured) or --needle-pose "
+            "(what FoundationPose saw, resolved through --grasp-calibration) "
+            "is required"
+        )
     return parsed
+
+
+def resolve_needle(args) -> tuple:
+    """Fill in ``--grasp-pos`` from a needle observation, and say what it did.
+
+    Returns ``(target, lines, ok)``.  A refusal here stops the run before the
+    arm is touched, which is the point: section 15's failure mode is a needle
+    outside the region the correction was measured in, and a Bernstein
+    polynomial does not degrade gracefully there.
+    """
+    try:
+        target, messages = calib_cli.apply_to_args(args, strict=args.strict)
+    except (ValueError, FileNotFoundError, KeyError) as exc:
+        return None, [str(exc)], False
+    if target is None:
+        return None, messages, True
+    lines = list(messages) + target.report.render().splitlines()
+    return target, lines, target.report.ok
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+
+    needle_target, needle_lines, needle_ok = resolve_needle(args)
+    for line in needle_lines:
+        print(line)
+    if not needle_ok:
+        print(
+            "\nthe needle observation was refused, so nothing was published.",
+            file=sys.stderr,
+        )
+        return 3
 
     jaw_cal = JawCalibration(
         open_rad=float(np.deg2rad(args.jaw_open_deg)),

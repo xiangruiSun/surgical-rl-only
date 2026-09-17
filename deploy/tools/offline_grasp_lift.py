@@ -39,6 +39,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from surgicai_rl_deploy.calib import cli as calib_cli  # noqa: E402
+
 from surgicai_rl_deploy.controllers import D2Controller, RLController, ResidualController
 from surgicai_rl_deploy.feasibility import precheck
 from surgicai_rl_deploy.frames import Pose
@@ -112,7 +114,7 @@ def parse_args(argv=None):
     )
     ap.add_argument("--start-pos", nargs=3, type=float, required=True)
     ap.add_argument("--start-quat", nargs=4, type=float, required=True)
-    ap.add_argument("--grasp-pos", nargs=3, type=float, required=True)
+    ap.add_argument("--grasp-pos", nargs=3, type=float, default=None)
     ap.add_argument("--grasp-quat", nargs=4, type=float, default=None)
     ap.add_argument(
         "--goal-orientation",
@@ -231,11 +233,26 @@ def parse_args(argv=None):
     ap.add_argument("--strict", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--json-out")
-    return ap.parse_args(argv)
+    calib_cli.add_arguments(ap)
+    parsed = ap.parse_args(argv)
+    if parsed.grasp_pos is None and not parsed.needle_pose:
+        ap.error("one of --grasp-pos or --needle-pose is required")
+    return parsed
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+
+    # A needle observation, if one was given, becomes --grasp-pos before
+    # anything else looks at it -- exactly as it does on the real node, so this
+    # rehearsal exercises the same path.
+    target, messages = calib_cli.apply_to_args(args, strict=getattr(args, "strict", False))
+    for line in messages:
+        print(line)
+    if target is not None:
+        print(target.report.render())
+        if not target.report.ok:
+            return 3
     np.set_printoptions(precision=3, suppress=True)
 
     jaw_cal = JawCalibration(
