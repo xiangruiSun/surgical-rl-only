@@ -254,7 +254,9 @@ def _audit(ds: CalibrationDataset, args) -> int:
     print("SESSION AUDIT")
     print("=" * 78)
     cov = ds.coverage()
-    print(f"  placements                 {len(ds)}")
+    print(f"  placements                 {len(ds)}"
+          + (f"  ({cov['n_dropped']} unusable, listed below)"
+             if cov.get("n_dropped") else ""))
     print(f"  span                       {cov['span_cm'][0]:.2f} x "
           f"{cov['span_cm'][1]:.2f} x {cov['span_cm'][2]:.2f} cm")
     print(f"  uniformity (1.0 = uniform) "
@@ -266,7 +268,7 @@ def _audit(ds: CalibrationDataset, args) -> int:
     print(f"  wrist spread               {ds.orientation_spread_deg():.2f} deg "
           f"-> {ds.jaw_offset_leakage_mm():.2f} mm of unmodellable residual")
 
-    nf = ds.noise_floor()
+    nf = ds.usable().noise_floor() if len(ds.usable()) else ds.noise_floor()
     print()
     print("  repeatability (section 6):")
     for key, name in [
@@ -280,11 +282,17 @@ def _audit(ds: CalibrationDataset, args) -> int:
                  else f"({v[0]:.3f}, {v[1]:.3f}, {v[2]:.3f}) mm sd"))
     floor = nf.get("residual_sd_3d_mm")
     if not nf.get("complete"):
+        missing = []
+        if nf.get("perception_sd_mm") is None:
+            missing.append("repeated FoundationPose frames")
+        if nf.get("grasp_sd_mm") is None:
+            missing.append("repeated taught grasps")
         print()
-        print("    ! No placement has repeated grasps, so the floor below counts")
-        print("      perception noise only and is a LOWER BOUND.  In the synthetic")
-        print("      rehearsal the taught grasp is the larger of the two terms.")
-        print("      Re-teach the grasp on a handful of placements before fitting.")
+        print(f"    ! No placement has {' or '.join(missing)}, so the floor")
+        print("      below is a LOWER BOUND and every adoption decision made")
+        print("      against it will be too generous.  In the synthetic rehearsal")
+        print("      the taught grasp is the LARGER of the two terms; collect a")
+        print("      handful of repeats before fitting.")
     if floor is not None:
         print(f"    3-D noise floor              {floor:.3f} mm")
 
@@ -306,13 +314,17 @@ def _audit(ds: CalibrationDataset, args) -> int:
     else:
         print("  no problems found")
 
+    usable = len(ds.usable())
     print()
-    print(format_variance_budget(len(ds), floor or 0.4))
+    print(format_variance_budget(usable, floor or 0.4))
     print()
-    target = placements_needed(2, "total", floor or 0.4, args.budget_mm)
-    print(f"  to support a degree-2 total model with under {args.budget_mm:.2f} mm of")
-    print(f"  fitting noise at this floor: {target} placements "
-          f"({max(0, target - len(ds))} more)")
+    print("  Read that column against the floor above, not against zero: a model")
+    print("  whose fitting noise is a third of the floor is not the thing limiting")
+    print("  the result.  To push it below a fixed budget instead:")
+    for budget in (args.budget_mm, (floor or 0.4) / 3.0):
+        target = placements_needed(2, "total", floor or 0.4, budget)
+        print(f"    degree-2 total under {budget:.2f} mm: {target} placements "
+              f"({max(0, target - usable)} more)")
     return 0
 
 

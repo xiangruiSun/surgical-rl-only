@@ -200,8 +200,26 @@ mm added RMS, at σ = 0.4 mm. Xiao et al. had 588 and 393 poses from a laser
 tracker and *still* restricted their Bernstein model to two variables and
 dropped the third to avoid overfitting. A hand-taught grasp session yields tens.
 
-**Recommendation: total degree, ≤ 2, at 60 or more placements.** Let the
-cross-validation pick between 0, 1 and 2, and expect it to say 1.
+The other half of the question is detection power: at how many placements can
+the procedure *tell* that a curved field is curved? From the rehearsal, six
+seeds per cell, a 1 mm saddle-shaped perception bias against a 0.43 mm floor:
+
+| placements | false positives (affine truth) | detections (curved truth) |
+|---|---|---|
+| 20 | 0/6 | 2/6 |
+| 30 | 0/6 | 5/6 |
+| **45** | **0/6** | **6/6** |
+| 60 | 0/6 | 6/6 |
+| 100 | 0/6 | 6/6 |
+
+The false-positive column is zero everywhere, which is the property that
+matters most: the procedure does not invent curvature. Detection becomes
+reliable at about 45.
+
+**Recommendation: total degree, ≤ 2, at 60 placements.** That is comfortably
+past the detection knee, leaves room for the handful of placements a pose flip
+will cost you, and keeps the degree-2 variance cost at 0.28 mm — below the
+floor. Let the cross-validation pick between 0, 1 and 2, and expect it to say 1.
 
 ---
 
@@ -319,7 +337,33 @@ something.
 
 The negative control (affine truth, which is what the physics predicts) must not
 adopt curvature; the positive control (a 1 mm saddle-shaped perception bias)
-must. Both are in the test suite, three seeds each.
+must. Both are in the test suite, three seeds each, and swept against placement
+count in the table above.
+
+A worked end-to-end run on a synthetic 60-placement session with a 3% pose-flip
+rate, which is what the real output looks like:
+
+```
+DROPPED BEFORE FITTING
+  p000: pose repeats: orientation spread 170.0 deg across repeats -- a pose flip, not noise
+  ... 7 of 60
+
+  FoundationPose, per frame    (0.398, 0.390, 0.375) mm sd
+  taught grasp, per repeat     (0.275, 0.286, 0.271) mm sd
+  residual, after averaging    (0.239, 0.240, 0.229) mm sd
+  3-D noise floor               0.409 mm
+
+  constant offset    ADOPTED   +3.379 mm [+3.284, +3.467]  wins 100% of resamples
+  affine             ADOPTED   +0.063 mm [+0.023, +0.104]  wins 100% of resamples
+  total degree 2     rejected  +0.002 mm [-0.003, +0.008]  wins  78% of resamples
+  total degree 3     rejected  +0.001 mm [-0.004, +0.006]  wins  67% of resamples
+
+  SELECTED: affine
+  3.873 -> 0.432 mm RMSE, floor 0.409 mm
+```
+
+0.432 against a floor of 0.409: the model is finished, and the thing left is
+measurement noise, not missing polynomial degree.
 
 ---
 

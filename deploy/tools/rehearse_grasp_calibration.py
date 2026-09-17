@@ -217,7 +217,11 @@ def main(argv=None) -> int:
     p = sub.add_parser("power", help="how many placements are needed")
     p.add_argument("--placements", type=int, nargs="+",
                    default=[20, 30, 45, 60, 90, 120])
-    p.add_argument("--trials", type=int, default=5)
+    p.add_argument("--trials", type=int, default=8,
+                   help="seeds per cell. Below about six the reported detection "
+                        "rate is itself noisy: at twenty placements the "
+                        "procedure finds a 1 mm curved bias roughly half the "
+                        "time, and four lucky seeds will report 100%%.")
     p.add_argument("--grasps", type=int, default=3)
     p.set_defaults(func=cmd_power)
 

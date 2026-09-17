@@ -335,15 +335,27 @@ class CalibrationDataset:
 
     # -- coverage ----------------------------------------------------------
     def coverage(self) -> dict:
-        p = self.p_nom()
+        """Where the usable placements sit, and how evenly.
+
+        Computed over :meth:`usable` rather than over everything, because a
+        placement with a flipped pose estimate has no well-defined nominal point
+        at all -- ``average_poses`` refuses to average two branches -- and the
+        audit that has to report that flip must not be the thing that crashes on
+        it.  ``n_dropped`` says how many were left out.
+        """
+        good = self.usable() if self.dropped() else self
+        p = good.p_nom()
         if len(p) == 0:
-            return {"span_cm": [0.0, 0.0, 0.0], "n": 0}
+            return {"span_cm": [0.0, 0.0, 0.0], "n": 0,
+                    "n_dropped": len(self.placements), "uniformity": [0.0] * 3,
+                    "centroid_cm": [0.0] * 3}
         span = (p.max(axis=0) - p.min(axis=0)) * 100.0
         # How much of the box the samples actually reach into, per axis: the
         # ratio of the sample standard deviation to that of a uniform fill.
         fill = (p.std(axis=0) * 100.0) / np.maximum(span / np.sqrt(12.0), 1e-9)
         return {
             "n": len(p),
+            "n_dropped": len(self.placements) - len(p),
             "span_cm": span.tolist(),
             "uniformity": fill.tolist(),
             "centroid_cm": (p.mean(axis=0) * 100.0).tolist(),
@@ -352,7 +364,7 @@ class CalibrationDataset:
     def problems(self) -> list:
         """Everything about this dataset that should be fixed before fitting."""
         out = []
-        n = len(self.placements)
+        n = len(self.placements) - len(self.dropped())
         if n < 8:
             out.append(
                 f"{n} placements is not enough to cross-validate anything; "
